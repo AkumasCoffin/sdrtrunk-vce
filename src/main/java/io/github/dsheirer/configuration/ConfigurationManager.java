@@ -41,6 +41,7 @@ import io.github.dsheirer.sample.Listener;
 import io.github.dsheirer.service.radioreference.RadioReference;
 import io.github.dsheirer.source.tuner.manager.TunerManager;
 import io.github.dsheirer.util.ThreadPool;
+import java.awt.GraphicsEnvironment;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -341,6 +342,86 @@ public class ConfigurationManager implements Listener<ChannelEvent>
                 if(hasDirtyConfiguration())
                 {
                     scheduleSave();
+                }
+            }
+        }
+    }
+
+    /**
+     * Headless variant of {@link #applyExternalConfigurationSnapshot(Callable)}.  Applies one externally prepared
+     * configuration snapshot without allowing an ordinary delayed save to interleave.
+     *
+     * <p>Desktop builds serialize external configuration operations on the JavaFX application thread; headless
+     * builds have no FX toolkit, so this variant instead requires headless mode and serializes on the headless web
+     * configuration lock (shared with the headless web administrator services) in addition to the instance monitor
+     * shared with the FX variant. Running channels are stopped, pending changes are saved, the external operation
+     * atomically commits, and the live models are reloaded before delayed saves are enabled again. The supplied
+     * operation must leave the database unchanged when it throws.</p>
+     */
+    public synchronized <T> T applyExternalConfigurationSnapshotHeadless(Callable<T> operation) throws Exception
+    {
+        Objects.requireNonNull(operation, "External configuration operation cannot be null");
+
+        if(!GraphicsEnvironment.isHeadless())
+        {
+            throw new IllegalStateException("Headless external configuration changes are only supported in " +
+                "headless mode - use applyExternalConfigurationSnapshot on the JavaFX application thread");
+        }
+
+        synchronized(mHeadlessWebConfigurationLock)
+        {
+            if(mExternalConfigurationOperation)
+            {
+                throw new IllegalStateException("Another external configuration operation is already running");
+            }
+
+            mExternalConfigurationOperation = true;
+            boolean databaseOperationCompleted = false;
+            boolean configurationReady = false;
+
+            try
+            {
+                mChannelProcessingManager.shutdown();
+                saveNow(true);
+
+                if(hasDirtyConfiguration())
+                {
+                    throw new IllegalStateException(
+                        "Unable to save the current configuration before applying the external configuration");
+                }
+
+                T result = operation.call();
+                databaseOperationCompleted = true;
+                transferStateToModels();
+                mConfigurationDirty.set(false);
+                configurationReady = true;
+                return result;
+            }
+            catch(Exception | Error e)
+            {
+                if(!databaseOperationCompleted)
+                {
+                    configurationReady = true;
+                }
+
+                if(databaseOperationCompleted && !configurationReady)
+                {
+                    throw new ExternalConfigurationReloadException(
+                        "The configuration was committed but could not be reloaded", e);
+                }
+
+                throw e;
+            }
+            finally
+            {
+                if(configurationReady)
+                {
+                    mExternalConfigurationOperation = false;
+
+                    if(hasDirtyConfiguration())
+                    {
+                        scheduleSave();
+                    }
                 }
             }
         }

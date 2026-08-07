@@ -24,6 +24,7 @@ import io.github.dsheirer.application.ApplicationInfo;
 import io.github.dsheirer.application.update.UpdateCheckResult;
 import io.github.dsheirer.application.update.UpdateCheckService;
 import io.github.dsheirer.audio.call.AudioCallCoordinator;
+import io.github.dsheirer.audio.call.CompletedAudioCall;
 import io.github.dsheirer.audio.call.DuplicateCallPriorityProvider;
 import io.github.dsheirer.audio.broadcast.AudioStreamingManager;
 import io.github.dsheirer.audio.broadcast.BroadcastFormat;
@@ -34,6 +35,7 @@ import io.github.dsheirer.controller.ControllerPanel;
 import io.github.dsheirer.controller.channel.Channel;
 import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelSelectionManager;
+import io.github.dsheirer.control.ControlServer;
 import io.github.dsheirer.database.SdrTrunkDatabaseBootstrap;
 import io.github.dsheirer.database.SdrTrunkDatabasePath;
 import io.github.dsheirer.eventbus.MyEventBus;
@@ -48,6 +50,9 @@ import io.github.dsheirer.gui.theme.ThemeManager;
 import io.github.dsheirer.gui.viewer.ViewRecordingViewerRequest;
 import io.github.dsheirer.gui.whatsnew.WhatsNewDialog;
 import io.github.dsheirer.icon.IconModel;
+import io.github.dsheirer.jmbe.JmbeCreator;
+import io.github.dsheirer.jmbe.github.GitHub;
+import io.github.dsheirer.jmbe.github.Release;
 import io.github.dsheirer.log.ApplicationLog;
 import io.github.dsheirer.map.MapService;
 import io.github.dsheirer.metadata.site.SiteControlChannelLearner;
@@ -56,6 +61,7 @@ import io.github.dsheirer.module.log.EventLogManager;
 import io.github.dsheirer.monitor.ResourceMonitor;
 import io.github.dsheirer.configuration.ConfigurationManager;
 import io.github.dsheirer.preference.UserPreferences;
+import io.github.dsheirer.preference.decoder.JmbeLibraryPreference;
 import io.github.dsheirer.preference.encryption.vault.EncryptionKeyVaultService;
 import io.github.dsheirer.preference.portable.SqlitePreferencesFactory;
 import io.github.dsheirer.preference.swing.JTableColumnWidthMonitor;
@@ -100,7 +106,10 @@ import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.prefs.Preferences;
 import javafx.embed.swing.JFXPanel;
 import jiconfont.icons.font_awesome.FontAwesome;
@@ -187,6 +196,7 @@ public class SDRTrunk implements Listener<TunerEvent>
     private boolean mSystemsVisible;
     private boolean mMainSplitPaneDividerRestored;
     private PortableDataRootLock mDataRootLock;
+    private ControlServer mControlServer;
 
     private String mTitle;
 
@@ -259,12 +269,21 @@ public class SDRTrunk implements Listener<TunerEvent>
             mUserPreferences, mP25ActivityLogService::receiveStreamedCall);
         mAudioStreamingManager.start();
 
-        mStatsWebServerService = new StatsWebServerService(mUserPreferences,
-            mConfigurationManager.getChannelProcessingManager(), mP25ActivityLogService);
+        boolean headless = GraphicsEnvironment.isHeadless();
+
+        if(!headless)
+        {
+            //Headless nodes don't run the embedded stats web server - the control server is the remote interface.
+            mStatsWebServerService = new StatsWebServerService(mUserPreferences,
+                mConfigurationManager.getChannelProcessingManager(), mP25ActivityLogService);
+        }
+
         mControlChannelQualityRegistry = new ControlChannelQualityRegistry();
+        Consumer<CompletedAudioCall> webConsumer = mStatsWebServerService != null ?
+            mStatsWebServerService::receive : call -> {};
         mAudioCallCoordinator = new AudioCallCoordinator(mUserPreferences, mAudioPlaybackManager,
             mAudioRecordingManager,
-            mAudioStreamingManager, mStatsWebServerService::receive, DuplicateCallPriorityProvider.NONE);
+            mAudioStreamingManager, webConsumer, DuplicateCallPriorityProvider.NONE);
 
         mConfigurationManager.getChannelProcessingManager().addAudioCallListener(mAudioCallCoordinator);
         mConfigurationManager.getChannelProcessingManager().addChannelDecodeEventListener(
@@ -275,7 +294,10 @@ public class SDRTrunk implements Listener<TunerEvent>
             mControlChannelQualityRegistry);
         mConfigurationManager.getChannelProcessingManager().addSiteMetadataListener(mP25ActivityLogService);
         mConfigurationManager.getChannelProcessingManager().addProtocolSiteMetadataListener(mP25ActivityLogService);
-        mP25ActivityLogService.addActivityCommitListener(mStatsWebServerService);
+        if(mStatsWebServerService != null)
+        {
+            mP25ActivityLogService.addActivityCommitListener(mStatsWebServerService);
+        }
         mConfigurationManager.getChannelProcessingManager().addSiteMetadataListener(mConfigurationManager.getBroadcastModel());
         mConfigurationManager.getChannelProcessingManager().addSiteMetadataListener(new SiteControlChannelLearner(mConfigurationManager));
 
@@ -305,9 +327,21 @@ public class SDRTrunk implements Listener<TunerEvent>
 
         mConfigurationManager.init();
 
+        //Start the headless control server if a control port was specified on the command line.
+        startControlServer(headless);
+
         if(GraphicsEnvironment.isHeadless())
         {
             mLog.info("starting main application headless");
+            //No GUI to run the calibration dialog or click "install JMBE" — do both
+            //here, synchronously, before channels start. On the genuine first run
+            //(work actually performed) restart once so channels come up with the
+            //calibration + JMBE fully applied (both are read at startup).
+            boolean didFirstRunWork = performHeadlessSetup(calibrationManager);
+            if(didFirstRunWork)
+            {
+                maybeRestartAfterFirstRunSetup();
+            }
         }
         else
         {
@@ -379,6 +413,14 @@ public class SDRTrunk implements Listener<TunerEvent>
                 vaultService.disableForRun();
             }
 
+            //HARD GATE: never start decoding until BOTH the CPU calibration and the JMBE voice codec are ready.
+            //Decoding without JMBE yields calls with no audio; running uncalibrated wastes CPU.  The control
+            //server's /config/reload will start the channels once both are in place (typically post-restart).
+            if(!isReadyToDecodeHeadless())
+            {
+                return;
+            }
+
             startChannelsWithoutDialog(channels);
             return;
         }
@@ -407,6 +449,210 @@ public class SDRTrunk implements Listener<TunerEvent>
                 mLog.error("Channel: " + channel.getName() + " auto-start failed: " + e.getMessage(), e);
             }
         }
+    }
+
+    /**
+     * Starts the headless control server when the {@code sdrtrunk.control.port} system property has been set (from the
+     * {@code --control-port} command line argument).  The control auth token is read from the
+     * {@code SDRTRUNK_CONTROL_TOKEN} environment variable.
+     *
+     * @param headless true if the application is running headless.
+     */
+    private void startControlServer(boolean headless)
+    {
+        String portProperty = System.getProperty("sdrtrunk.control.port");
+
+        if(portProperty == null || portProperty.isEmpty())
+        {
+            return;
+        }
+
+        try
+        {
+            int port = Integer.parseInt(portProperty.trim());
+            String token = System.getenv("SDRTRUNK_CONTROL_TOKEN");
+            mControlServer = new ControlServer(mTunerManager, mConfigurationManager, mP25ActivityLogService,
+                mUserPreferences, this::isReadyToDecodeHeadless, headless, port, token);
+            mControlServer.start();
+            mLog.info("Headless control server started on port [" + port + "]");
+        }
+        catch(Exception e)
+        {
+            mLog.error("Unable to start headless control server on port [" + portProperty + "]", e);
+        }
+    }
+
+    /**
+     * First-run setup for a HEADLESS node. There's no GUI to run the CPU
+     * calibration dialog or to click the "install JMBE" button, so do both here.
+     * Both persist, so subsequent starts skip straight through. Runs synchronously
+     * (before channels auto-start) so voice audio is available when decoding begins.
+     */
+    private boolean performHeadlessSetup(CalibrationManager calibrationManager)
+    {
+        boolean didWork = false;
+
+        //1) CPU (vector/SIMD) calibration — normally a first-run dialog.
+        try
+        {
+            if(!calibrationManager.isCalibrated())
+            {
+                mLog.info("headless: running one-time CPU calibration (this can take a minute)...");
+                calibrationManager.calibrate();
+                mLog.info("headless: CPU calibration complete");
+                didWork = true;
+            }
+            else
+            {
+                mLog.info("headless: CPU calibration already done");
+            }
+        }
+        catch(Exception e)
+        {
+            mLog.error("headless: CPU calibration failed; continuing with default implementations", e);
+        }
+
+        //2) JMBE audio library (AMBE/IMBE voice codec) — required to produce voice
+        //   audio. Without it a call decodes + shows in Now Playing but yields no
+        //   audio to record/stream.
+        try
+        {
+            if(ensureJmbeLibraryHeadless())
+            {
+                didWork = true;
+            }
+        }
+        catch(Exception e)
+        {
+            mLog.error("headless: JMBE auto-install failed; voice audio will be unavailable", e);
+        }
+
+        return didWork;
+    }
+
+    /**
+     * Ensures a JMBE audio library is installed and referenced, downloading +
+     * building the latest release (the same flow as the GUI's JMBE editor) when
+     * absent. No-op once installed.
+     */
+    private boolean ensureJmbeLibraryHeadless() throws Exception
+    {
+        JmbeLibraryPreference jmbePref = mUserPreferences.getJmbeLibraryPreference();
+        Path existing = jmbePref.getPathJmbeLibrary();
+        if(existing != null && Files.exists(existing))
+        {
+            mLog.info("headless: JMBE audio library present [" + existing + "]");
+            return false;
+        }
+
+        mLog.info("headless: JMBE audio library missing - auto-installing from GitHub (one-time)...");
+        Release release = GitHub.getLatestRelease(JmbeCreator.GITHUB_JMBE_RELEASES_URL);
+        if(release == null)
+        {
+            mLog.error("headless: could not resolve the latest JMBE release; voice audio unavailable");
+            return false;
+        }
+
+        Path jmbeDir = mUserPreferences.getDirectoryPreference().getDirectoryApplicationRoot().resolve("jmbe");
+        Files.createDirectories(jmbeDir);
+        Path library = jmbeDir.resolve("jmbe-" + release.getVersion() + ".jar");
+
+        JmbeCreator creator = new JmbeCreator(release, library);
+        CountDownLatch latch = new CountDownLatch(1);
+        creator.completeProperty().addListener((obs, oldV, complete) -> {
+            if(complete)
+            {
+                latch.countDown();
+            }
+        });
+        creator.execute(); //async build on a background thread
+        if(!creator.completeProperty().get())
+        {
+            latch.await(5, TimeUnit.MINUTES);
+        }
+
+        if(!creator.hasErrors() && Files.exists(library))
+        {
+            jmbePref.setPathJmbeLibrary(library);
+            mLog.info("headless: JMBE audio library installed [" + library + "]");
+            return true;
+        }
+
+        mLog.error("headless: JMBE library build did not complete; voice audio unavailable");
+        return false;
+    }
+
+    /**
+     * True only when BOTH the CPU calibration and the JMBE voice codec are ready.
+     * Headless channels must not decode until this holds (no JMBE -> calls with no
+     * audio).  The gate only applies headless - GUI builds always return true.
+     */
+    private boolean isReadyToDecodeHeadless()
+    {
+        if(!GraphicsEnvironment.isHeadless())
+        {
+            return true;
+        }
+
+        boolean calibrated = CalibrationManager.getInstance().isCalibrated();
+        Path jmbe = mUserPreferences.getJmbeLibraryPreference().getPathJmbeLibrary();
+        boolean jmbeOk = jmbe != null && Files.exists(jmbe);
+        if(!calibrated || !jmbeOk)
+        {
+            mLog.error("headless: NOT auto-starting channels — calibrated=" + calibrated + " jmbeInstalled=" + jmbeOk +
+                    ". Decoding without the JMBE codec produces no voice audio; channels will start once both are ready.");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * After a genuine first-run setup (calibration and/or JMBE install), restart
+     * SDR-Trunk so channels come up with the calibration + JMBE applied (both are
+     * read at startup). A restart COUNTER in the (writable) app root bounds this
+     * to a few restarts — enough for calibration then a (possibly retried) JMBE
+     * install to each settle, but capped so it can never loop even if the persisted
+     * "calibrated" flag / JMBE path fail to save (e.g. HOME not writable).
+     */
+    private void maybeRestartAfterFirstRunSetup()
+    {
+        final int MAX_RESTARTS = 3;
+        Path counter = mUserPreferences.getDirectoryPreference().getDirectoryApplicationRoot()
+                .resolve(".headless-setup-restarts");
+
+        int count = 0;
+        try
+        {
+            if(Files.exists(counter))
+            {
+                count = Integer.parseInt(Files.readString(counter).trim());
+            }
+        }
+        catch(Exception ignore)
+        {
+            count = 0;
+        }
+
+        if(count >= MAX_RESTARTS)
+        {
+            mLog.warn("headless: first-run setup did work again but already restarted " + count + " times - NOT " +
+                    "restarting (avoiding a loop). Calibration/JMBE prefs may not be persisting; ensure HOME is writable.");
+            return;
+        }
+
+        try
+        {
+            Files.writeString(counter, Integer.toString(count + 1));
+        }
+        catch(Exception e)
+        {
+            mLog.error("headless: could not write restart counter; NOT restarting (avoiding a possible loop)", e);
+            return;
+        }
+
+        mLog.info("headless: first-run setup did work - restarting SDR-Trunk (restart " + (count + 1) + " of " +
+                MAX_RESTARTS + ") so channels start with calibration + JMBE applied");
+        System.exit(0); //the node supervisor relaunches; a subsequent clean run auto-starts channels
     }
 
     private EncryptionKeyVaultService getLockedLaunchVault()
@@ -825,28 +1071,38 @@ public class SDRTrunk implements Listener<TunerEvent>
 
         mShutdownProcessed = true;
         mLog.info("Application shutdown started ...");
-        mUserPreferences.getSwingPreference().setLocation(WINDOW_FRAME_IDENTIFIER, mMainGui.getLocation());
-        mUserPreferences.getSwingPreference().setDimension(WINDOW_FRAME_IDENTIFIER, mMainGui.getSize());
-        mUserPreferences.getSwingPreference().setMaximized(WINDOW_FRAME_IDENTIFIER,
-            (mMainGui.getExtendedState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH);
-        mPreferences.putBoolean(PREFERENCE_SYSTEMS_VISIBLE, mSystemsVisible);
-        if(mSpectralPanelVisible)
+
+        if(mControlServer != null)
         {
-            mUserPreferences.getSwingPreference().setDimension(SPECTRAL_PANEL_IDENTIFIER, mSpectralPanel.getSize());
-            mUserPreferences.getSwingPreference().setInt(MAIN_SPLIT_PANE_DIVIDER_IDENTIFIER,
-                getMainSplitPaneDividerLocation());
+            mControlServer.stop();
+            mControlServer = null;
         }
 
-        mUserPreferences.getSwingPreference().setDimension(CONTROLLER_PANEL_IDENTIFIER, mControllerPanel.getSize());
-        mUserPreferences.getSwingPreference().setInt(SPECTRAL_DISPLAY_DIVIDER_IDENTIFIER,
-            mSpectralPanel.getSplitPaneDividerLocation());
-        mUserPreferences.getSwingPreference().setInt(NOW_PLAYING_SPLIT_PANE_DIVIDER_IDENTIFIER,
-            mControllerPanel.getNowPlayingPanel().getSplitPaneDividerLocation());
-        mUserPreferences.getSwingPreference().setInt(CHANNEL_SPECTRUM_SPLIT_PANE_DIVIDER_IDENTIFIER,
-            mControllerPanel.getNowPlayingPanel().getChannelSpectrumPanelDividerLocation());
-        mUserPreferences.getSwingPreference().flush();
-        mControllerPanel.dispose();
-        mJavaFxWindowManager.shutdown();
+        if(!GraphicsEnvironment.isHeadless())
+        {
+            mUserPreferences.getSwingPreference().setLocation(WINDOW_FRAME_IDENTIFIER, mMainGui.getLocation());
+            mUserPreferences.getSwingPreference().setDimension(WINDOW_FRAME_IDENTIFIER, mMainGui.getSize());
+            mUserPreferences.getSwingPreference().setMaximized(WINDOW_FRAME_IDENTIFIER,
+                (mMainGui.getExtendedState() & Frame.MAXIMIZED_BOTH) == Frame.MAXIMIZED_BOTH);
+            mPreferences.putBoolean(PREFERENCE_SYSTEMS_VISIBLE, mSystemsVisible);
+            if(mSpectralPanelVisible)
+            {
+                mUserPreferences.getSwingPreference().setDimension(SPECTRAL_PANEL_IDENTIFIER, mSpectralPanel.getSize());
+                mUserPreferences.getSwingPreference().setInt(MAIN_SPLIT_PANE_DIVIDER_IDENTIFIER,
+                    getMainSplitPaneDividerLocation());
+            }
+
+            mUserPreferences.getSwingPreference().setDimension(CONTROLLER_PANEL_IDENTIFIER, mControllerPanel.getSize());
+            mUserPreferences.getSwingPreference().setInt(SPECTRAL_DISPLAY_DIVIDER_IDENTIFIER,
+                mSpectralPanel.getSplitPaneDividerLocation());
+            mUserPreferences.getSwingPreference().setInt(NOW_PLAYING_SPLIT_PANE_DIVIDER_IDENTIFIER,
+                mControllerPanel.getNowPlayingPanel().getSplitPaneDividerLocation());
+            mUserPreferences.getSwingPreference().setInt(CHANNEL_SPECTRUM_SPLIT_PANE_DIVIDER_IDENTIFIER,
+                mControllerPanel.getNowPlayingPanel().getChannelSpectrumPanelDividerLocation());
+            mUserPreferences.getSwingPreference().flush();
+            mControllerPanel.dispose();
+            mJavaFxWindowManager.shutdown();
+        }
         mLog.info("Stopping channels ...");
         if(mStatsWebServerService != null)
         {
@@ -891,8 +1147,11 @@ public class SDRTrunk implements Listener<TunerEvent>
         }
         mResourceMonitor.stop();
 
-        mLog.info("Stopping spectral display ...");
-        mSpectralPanel.clearTuner();
+        if(!GraphicsEnvironment.isHeadless())
+        {
+            mLog.info("Stopping spectral display ...");
+            mSpectralPanel.clearTuner();
+        }
         mLog.info("Stopping tuners ...");
         mTunerManager.stop();
         mLog.info("Shutdown complete.");
@@ -1320,9 +1579,25 @@ public class SDRTrunk implements Listener<TunerEvent>
 
     /**
      * Launch the application.
+     *
+     * Supported command line arguments (parsed BEFORE any AWT/Swing class is touched and BEFORE the data root
+     * is resolved):
+     *   --headless                      run without a GUI (sets java.awt.headless=true).
+     *   --control-port &lt;int&gt;            start the headless control server on the given loopback port (WS on port+1).
+     *   --app-root &lt;dir&gt;                relocate the application data root (sets the portable data root property).
+     *   --stats-logging on|off          enable/disable stats summary logging.
+     *   --stats-detailed-history on|off enable/disable detailed stats history.
+     *   --stats-retention-days &lt;int&gt;    stats logging retention period in days.
+     *
+     * Database bootstrap arguments (--fresh/--import-xml/--upgrade-data/--upgrade-current) pass through to
+     * {@link SdrTrunkDatabaseBootstrap}.  The control auth token is read from the SDRTRUNK_CONTROL_TOKEN
+     * environment variable.
      */
     public static void main(String[] args)
     {
+        //Must run before PortableApplicationPaths.getDataRoot() is called and before any AWT class initializes.
+        parseArguments(args);
+
         System.setProperty("apple.awt.application.name", "sdrtrunk-vce");
         PortableDataRootLock dataRootLock = null;
 
@@ -1361,6 +1636,10 @@ public class SDRTrunk implements Listener<TunerEvent>
                 userPreferences.getApplicationPreference().setStatsLoggingEnabled(true);
             }
 
+            //Command-line stats overrides (--stats-logging / --stats-detailed-history / --stats-retention-days)
+            //win over the new-preferences default above.
+            applyStatsArguments(userPreferences);
+
             new SDRTrunk(userPreferences, dataRootLock);
             dataRootLock = null;
         }
@@ -1392,5 +1671,113 @@ public class SDRTrunk implements Listener<TunerEvent>
 
             System.exit(1);
         }
+    }
+
+    /**
+     * Parses command line arguments.  Must be invoked before any AWT/Swing class is referenced (so headless mode
+     * takes effect before the toolkit initializes) and before the portable data root is resolved (so --app-root
+     * takes effect).  Unrecognized arguments are ignored - the database bootstrap flags are parsed separately by
+     * {@link SdrTrunkDatabaseBootstrap}.
+     *
+     * @param args command line arguments.
+     */
+    private static void parseArguments(String[] args)
+    {
+        if(args == null)
+        {
+            return;
+        }
+
+        for(int i = 0; i < args.length; i++)
+        {
+            String arg = args[i];
+
+            switch(arg)
+            {
+                case "--headless":
+                    //Must be the very first thing we do so the toolkit initializes headless.
+                    System.setProperty("java.awt.headless", "true");
+                    break;
+                case "--control-port":
+                    if(i + 1 < args.length)
+                    {
+                        System.setProperty("sdrtrunk.control.port", args[++i]);
+                    }
+                    break;
+                case "--app-root":
+                    if(i + 1 < args.length)
+                    {
+                        //Read lazily by PortableApplicationPaths.getDataRoot().
+                        System.setProperty(PortableApplicationPaths.DATA_ROOT_PROPERTY, args[++i]);
+                    }
+                    break;
+                case "--stats-logging":
+                    if(i + 1 < args.length)
+                    {
+                        System.setProperty("sdrtrunk.stats.logging", args[++i]);
+                    }
+                    break;
+                case "--stats-detailed-history":
+                    if(i + 1 < args.length)
+                    {
+                        System.setProperty("sdrtrunk.stats.detailed.history", args[++i]);
+                    }
+                    break;
+                case "--stats-retention-days":
+                    if(i + 1 < args.length)
+                    {
+                        System.setProperty("sdrtrunk.stats.retention.days", args[++i]);
+                    }
+                    break;
+                default:
+                    //ignore unrecognized arguments (database bootstrap flags pass through)
+                    break;
+            }
+        }
+    }
+
+    /**
+     * Applies the stats system properties captured by {@link #parseArguments(String[])} to the application
+     * preferences.  No-op for any property that was not supplied on the command line.
+     */
+    private static void applyStatsArguments(UserPreferences userPreferences)
+    {
+        String logging = System.getProperty("sdrtrunk.stats.logging");
+
+        if(logging != null && !logging.isEmpty())
+        {
+            userPreferences.getApplicationPreference().setStatsLoggingEnabled(parseOnOff(logging));
+        }
+
+        String detailedHistory = System.getProperty("sdrtrunk.stats.detailed.history");
+
+        if(detailedHistory != null && !detailedHistory.isEmpty())
+        {
+            userPreferences.getApplicationPreference().setStatsDetailedHistoryEnabled(parseOnOff(detailedHistory));
+        }
+
+        String retentionDays = System.getProperty("sdrtrunk.stats.retention.days");
+
+        if(retentionDays != null && !retentionDays.isEmpty())
+        {
+            try
+            {
+                userPreferences.getApplicationPreference().setStatsLoggingRetentionDays(
+                    Integer.parseInt(retentionDays.trim()));
+            }
+            catch(NumberFormatException nfe)
+            {
+                mLog.warn("Ignoring invalid --stats-retention-days value [" + retentionDays + "]");
+            }
+        }
+    }
+
+    /**
+     * Parses an on/off style command-line value ("on"/"true"/"1" are true; anything else is false).
+     */
+    private static boolean parseOnOff(String value)
+    {
+        String normalized = value.trim();
+        return "on".equalsIgnoreCase(normalized) || "true".equalsIgnoreCase(normalized) || "1".equals(normalized);
     }
 }
