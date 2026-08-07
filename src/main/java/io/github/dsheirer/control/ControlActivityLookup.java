@@ -19,6 +19,7 @@
 package io.github.dsheirer.control;
 
 import io.github.dsheirer.database.SdrTrunkDatabase;
+import io.github.dsheirer.module.decode.event.DecodeEventType;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -26,8 +27,12 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,6 +46,20 @@ import org.slf4j.LoggerFactory;
 public class ControlActivityLookup
 {
     private static final Logger mLog = LoggerFactory.getLogger(ControlActivityLookup.class);
+
+    /**
+     * Event-type codes (DecodeEventType ordinal + 1, matching the resolved view's event_type_code decoding) that
+     * represent call traffic for the calls-only events filter - enum names containing CALL, DATA or PAGE:
+     * CALL, CALL_ENCRYPTED, CALL_GROUP, CALL_GROUP_ENCRYPTED, CALL_PATCH_GROUP, CALL_PATCH_GROUP_ENCRYPTED,
+     * CALL_ALERT, CALL_DETECT, CALL_IN_PROGRESS, CALL_DO_NOT_MONITOR, CALL_END, CALL_INTERCONNECT,
+     * CALL_INTERCONNECT_ENCRYPTED, CALL_UNIQUE_ID, CALL_UNIT_TO_UNIT, CALL_UNIT_TO_UNIT_ENCRYPTED, CALL_NO_TUNER,
+     * CALL_TIMEOUT, DATA_CALL, DATA_CALL_ENCRYPTED, DATA_PACKET, PAGE.
+     */
+    private static final String CALL_EVENT_TYPE_CODES = Arrays.stream(DecodeEventType.values())
+            .filter(type -> type.name().contains("CALL") || type.name().contains("DATA") ||
+                    type.name().contains("PAGE"))
+            .map(type -> Integer.toString(type.ordinal() + 1))
+            .collect(Collectors.joining(","));
 
     private final Path mDatabasePath;
 
@@ -121,6 +140,86 @@ public class ControlActivityLookup
         }
 
         return notFound;
+    }
+
+    /**
+     * Returns detailed activity events newer than the supplied id, in id order, for the node agent's activity feed.
+     *
+     * <p>Detail rows only exist when the detailed-history preference is enabled.  A busy/locked/missing database
+     * yields the empty result rather than an error.</p>
+     *
+     * @param sinceId exclusive lower bound on the event id (0 for the oldest retained events).
+     * @param limit maximum events to return, clamped to 1..500.
+     * @param callsOnly true to restrict to call traffic (voice/encrypted/data calls and pages - see
+     *        {@link #CALL_EVENT_TYPE_CODES}), false for all event types.
+     * @return result map: {@code {events:[...], lastId:<max id returned, or sinceId when empty>}}.
+     */
+    public Map<String,Object> recentEvents(long sinceId, int limit, boolean callsOnly)
+    {
+        List<Map<String,Object>> events = new ArrayList<>();
+        long lastId = sinceId;
+
+        Map<String,Object> result = new LinkedHashMap<>();
+        result.put("events", events);
+        result.put("lastId", lastId);
+
+        if(!Files.isRegularFile(mDatabasePath))
+        {
+            return result;
+        }
+
+        int clamped = Math.max(1, Math.min(500, limit));
+
+        String sql = "SELECT id, observed_at_ms, action, event_type, source_radio_id, target_id, frequency_hz, " +
+                "timeslot, encrypted, resolved_rfss, resolved_site, resolved_nac, resolved_wacn, " +
+                "resolved_system_id, resolved_channel_name FROM p25_activity_event_resolved WHERE id > ?" +
+                (callsOnly ? " AND event_type_code IN (" + CALL_EVENT_TYPE_CODES + ")" : "") +
+                " ORDER BY id ASC LIMIT " + clamped;
+
+        try(Connection connection = openReadOnly();
+            PreparedStatement statement = connection.prepareStatement(sql))
+        {
+            statement.setLong(1, sinceId);
+
+            try(ResultSet results = statement.executeQuery())
+            {
+                while(results.next())
+                {
+                    long id = results.getLong(1);
+                    lastId = Math.max(lastId, id);
+
+                    Map<String,Object> event = new LinkedHashMap<>();
+                    event.put("id", id);
+                    event.put("atMs", results.getObject(2));
+                    event.put("action", results.getObject(3));
+                    event.put("eventType", results.getObject(4));
+                    event.put("source", results.getObject(5));
+                    event.put("target", results.getObject(6));
+                    event.put("frequencyHz", results.getObject(7));
+                    event.put("timeslot", results.getObject(8));
+                    Object encrypted = results.getObject(9);
+                    event.put("encrypted", encrypted != null ? ((Number)encrypted).intValue() != 0 : null);
+                    event.put("rfss", results.getObject(10));
+                    event.put("site", results.getObject(11));
+                    event.put("nac", results.getObject(12));
+                    event.put("wacn", results.getObject(13));
+                    event.put("systemId", results.getObject(14));
+                    event.put("channelName", results.getObject(15));
+                    events.add(event);
+                }
+            }
+
+            result.put("lastId", lastId);
+        }
+        catch(Exception e)
+        {
+            //Busy/locked/missing database - report the empty result so the caller retries on the next poll.
+            mLog.debug("Recent-events lookup failed - returning empty result", e);
+            events.clear();
+            result.put("lastId", sinceId);
+        }
+
+        return result;
     }
 
     /**

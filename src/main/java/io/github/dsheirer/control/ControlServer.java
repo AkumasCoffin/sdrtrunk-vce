@@ -1881,6 +1881,24 @@ public class ControlServer
                 return;
             }
 
+            if(path.equals("/activity/events"))
+            {
+                Map<String,String> query = parseQuery(exchange.getRequestURI().getRawQuery());
+
+                Long sinceId = query.containsKey("sinceId") ? parseLong(query.get("sinceId")) : Long.valueOf(0L);
+                Integer limit = query.containsKey("limit") ? parseInteger(query.get("limit")) : Integer.valueOf(200);
+                String kinds = query.containsKey("kinds") ? query.get("kinds") : "calls";
+
+                if(sinceId == null || limit == null || !(kinds.equals("calls") || kinds.equals("all")))
+                {
+                    sendJson(exchange, 400, error("malformed sinceId, limit or kinds query parameter"));
+                    return;
+                }
+
+                sendJson(exchange, 200, mActivityLookup.recentEvents(sinceId, limit, !kinds.equals("all")));
+                return;
+            }
+
             sendJson(exchange, 404, error("not found"));
         }
         catch(Exception e)
