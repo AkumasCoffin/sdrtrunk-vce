@@ -935,6 +935,18 @@ tasks.register('nodeRuntimeZip', Zip) {
     exclude '**/stats-web'
     exclude '**/stats-web/**'
 
+    //Repacking through zipTree drops the exec bits the runtime-plugin zip carried, and the node agent
+    //extracts with the archive's recorded mode — so mark every runtime executable explicitly or the
+    //launcher fails with EACCES on Linux (bin/* launchers + java, lib/jspawnhelper for Process.spawn).
+    eachFile { details ->
+        def p = details.relativePath.pathString
+        if((p.contains('/bin/') || p.endsWith('/lib/jspawnhelper') || p.endsWith('/lib/jexec')) &&
+            !p.endsWith('.bat') && !p.endsWith('.dll'))
+        {
+            details.permissions { unix(0755) }
+        }
+    }
+
     //The runtime plugin appends the target-platform name to the intermediate zip file name, so locate it lazily.
     //This closure is evaluated once at task-graph time (for dependency inference - the predicted path is fine
     //even though the file doesn't exist yet) and again at execution time, when the scan finds the real file.
