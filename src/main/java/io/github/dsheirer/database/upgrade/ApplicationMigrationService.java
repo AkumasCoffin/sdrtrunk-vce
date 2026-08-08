@@ -56,8 +56,9 @@ public final class ApplicationMigrationService
 {
     public static final int ALPHA_7_P25_VERSION = 21;
     public static final int ALPHA_7_ALIAS_VERSION = 3;
+    public static final int ALPHA_9_P25_VERSION = 24;
     public static final Set<Integer> SUPPORTED_P25_VERSIONS =
-        Set.of(ALPHA_7_P25_VERSION, P25ActivityLogSchema.SCHEMA_VERSION);
+        Set.of(ALPHA_7_P25_VERSION, ALPHA_9_P25_VERSION, P25ActivityLogSchema.SCHEMA_VERSION);
     public static final Set<Integer> SUPPORTED_ALIAS_VERSIONS = Set.of(ALPHA_7_ALIAS_VERSION, 4);
     public static final int CURRENT_P25_VERSION = P25ActivityLogSchema.SCHEMA_VERSION;
     public static final int CURRENT_ALIAS_VERSION = 4;
@@ -330,7 +331,9 @@ public final class ApplicationMigrationService
         if(!state.supported())
         {
             throw new IOException("This release accepts only the complete Alpha 7 database (Alias v3, P25 " +
-                "activity v21, trunked-site v2, and no DMR activity schema) or its complete current database " +
+                "activity v21, trunked-site v2, and no DMR activity schema), the complete Alpha 9 database " +
+                "(Alias v4, P25 activity v" + ALPHA_9_P25_VERSION + ", trunked-site v2, and DMR activity v" +
+                CURRENT_DMR_VERSION + "), or its complete current database " +
                 "(Alias v4, P25 activity v" + CURRENT_P25_VERSION + ", trunked-site v2, and DMR activity v" +
                 CURRENT_DMR_VERSION + "). Found " + state.description() + ".");
         }
@@ -967,7 +970,7 @@ public final class ApplicationMigrationService
 
         public boolean supported()
         {
-            return current() || alpha7();
+            return current() || alpha9() || alpha7();
         }
 
         public boolean current()
@@ -983,9 +986,16 @@ public final class ApplicationMigrationService
                 Integer.valueOf(TrunkedSiteSchema.SCHEMA_VERSION).equals(trunkedSiteVersion) && dmrVersion == null;
         }
 
+        public boolean alpha9()
+        {
+            return aliasVersion == CURRENT_ALIAS_VERSION && p25Version == ALPHA_9_P25_VERSION &&
+                Integer.valueOf(TrunkedSiteSchema.SCHEMA_VERSION).equals(trunkedSiteVersion) &&
+                Integer.valueOf(CURRENT_DMR_VERSION).equals(dmrVersion);
+        }
+
         public boolean requiresMigration()
         {
-            return alpha7();
+            return alpha7() || alpha9();
         }
 
         public String description()
@@ -1004,6 +1014,10 @@ public final class ApplicationMigrationService
             if(alpha7())
             {
                 return "convert Alpha 7 channels and aliases and start activity/statistics history fresh";
+            }
+            if(alpha9())
+            {
+                return "add the deduplicated call counter to existing activity history";
             }
             return "no bundled transition exists for this schema combination";
         }

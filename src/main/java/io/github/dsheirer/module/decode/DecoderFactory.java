@@ -33,6 +33,9 @@ import io.github.dsheirer.identifier.patch.PatchGroupManager;
 import io.github.dsheirer.message.IMessage;
 import io.github.dsheirer.metadata.site.SiteMetadataPublicationRateLimiter;
 import io.github.dsheirer.module.Module;
+import io.github.dsheirer.module.decode.am.AMDecoder;
+import io.github.dsheirer.module.decode.am.AMDecoderState;
+import io.github.dsheirer.module.decode.am.DecodeConfigAM;
 import io.github.dsheirer.module.decode.config.AuxDecodeConfiguration;
 import io.github.dsheirer.module.decode.config.DecodeConfiguration;
 import io.github.dsheirer.module.decode.dcs.DCSDecoder;
@@ -156,6 +159,9 @@ public class DecoderFactory
         /* Baseband low-pass filter pass and stop frequencies */
         switch(decodeConfig.getDecoderType())
         {
+            case AM:
+                processAM(channel, modules, aliasList, decodeConfig);
+                break;
             case DMR:
                 processDMR(channel, userPreferences, modules, aliasList, (DecodeConfigDMR)decodeConfig,
                     trafficChannelManager, channelDescriptor, initialSourceSampleRate, channelActivityModel);
@@ -414,6 +420,27 @@ public class DecoderFactory
     }
 
     /**
+     * Creates decoder modules for the AM (airband) decoder
+     * @param channel configuration
+     * @param modules collection to add to
+     * @param aliasList for the channel
+     * @param decodeConfig for the channel
+     */
+    private static void processAM(Channel channel, List<Module> modules, AliasList aliasList, DecodeConfiguration decodeConfig)
+    {
+        if(!(decodeConfig instanceof DecodeConfigAM))
+        {
+            throw new IllegalArgumentException("Can't create AM decoder - unrecognized decode config type: " +
+                    (decodeConfig != null ? decodeConfig.getClass() : "null/empty"));
+        }
+
+        DecodeConfigAM decodeConfigAM = (DecodeConfigAM)decodeConfig;
+        modules.add(new AMDecoder(decodeConfigAM));
+        modules.add(new AMDecoderState(channel.getName(), decodeConfigAM));
+        modules.add(new AudioModule(aliasList, 0, 60000, false));
+    }
+
+    /**
      * Creates modules for DMR decoder setup.
      *
      * Note: on some DMR systems (e.g. Capacity+) we convert standard channels to traffic channels (when rest channel
@@ -647,6 +674,8 @@ public class DecoderFactory
     {
         switch(decoder)
         {
+            case AM:
+                return new DecodeConfigAM();
             case DMR:
                 return new DecodeConfigDMR();
             case NBFM:
@@ -673,6 +702,14 @@ public class DecoderFactory
         {
             switch(config.getDecoderType())
             {
+                case AM:
+                    DecodeConfigAM originalAM = (DecodeConfigAM)config;
+                    DecodeConfigAM copyAM = new DecodeConfigAM();
+                    copyAM.setBandwidth(originalAM.getBandwidth());
+                    copyAM.setTalkgroup(originalAM.getTalkgroup());
+                    copyAM.setSquelchThreshold(originalAM.getSquelchThreshold());
+                    copyAM.setSquelchAutoTrack(originalAM.isSquelchAutoTrack());
+                    return copyAM;
                 case DMR:
                     DecodeConfigDMR originalDMR = (DecodeConfigDMR)config;
                     DecodeConfigDMR copyDMR = new DecodeConfigDMR();

@@ -56,6 +56,7 @@ class P25ActivityLogWriter implements AutoCloseable
     private final AtomicLong mDroppedRecords = new AtomicLong();
     private final AtomicLong mWrittenRecords = new AtomicLong();
     private final AtomicLong mLastSuccessfulWriteMs = new AtomicLong();
+    private final CrossSiteCallDeduplicator mCrossSiteCallDeduplicator = new CrossSiteCallDeduplicator();
     private final P25ActivityCommitListener mCommitListener;
     private ExecutorService mExecutorService;
     private volatile int mRetentionDays;
@@ -569,7 +570,7 @@ class P25ActivityLogWriter implements AutoCloseable
                 if(record instanceof P25ActivityLogRecords.ActivityEvent activityEvent)
                 {
                     Long activityId = P25ActivityLogSchema.recordActivity(connection, activityEvent,
-                        mDetailedEventHistoryEnabled);
+                        mDetailedEventHistoryEnabled, mCrossSiteCallDeduplicator);
 
                     if(activityId != null)
                     {

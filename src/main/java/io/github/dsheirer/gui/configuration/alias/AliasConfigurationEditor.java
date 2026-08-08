@@ -87,6 +87,7 @@ public class AliasConfigurationEditor extends SplitPane implements IAliasListRef
     private TableView<Alias> mAliasTableView;
     private Label mPlaceholderLabel;
     private Button mNewAliasButton;
+    private Button mImportAliasButton;
     private Button mDeleteAliasButton;
     private Button mCloneAliasButton;
     private MenuButton mMoveToAliasButton;
@@ -309,8 +310,9 @@ public class AliasConfigurationEditor extends SplitPane implements IAliasListRef
                     .addListener((observable, oldValue, newValue) ->
                     {
                         AliasListDefinition definition = getAliasListDefinition(newValue);
-                        getNewAliasButton().setDisable(definition == null ||
-                            AliasMatchRegistry.allowed(definition).isEmpty());
+                        boolean disable = definition == null || AliasMatchRegistry.allowed(definition).isEmpty();
+                        getNewAliasButton().setDisable(disable);
+                        getImportAliasButton().setDisable(disable);
                         update();
                     });
 
@@ -571,8 +573,8 @@ public class AliasConfigurationEditor extends SplitPane implements IAliasListRef
 
             Button fillerButton = new Button();
             fillerButton.setVisible(false);
-            mButtonBox.getChildren().addAll(fillerButton, getNewAliasButton(), getCloneAliasButton(),
-                    getMoveToAliasButton(), getDeleteAliasButton());
+            mButtonBox.getChildren().addAll(fillerButton, getNewAliasButton(), getImportAliasButton(),
+                    getCloneAliasButton(), getMoveToAliasButton(), getDeleteAliasButton());
         }
 
         return mButtonBox;
@@ -612,6 +614,31 @@ public class AliasConfigurationEditor extends SplitPane implements IAliasListRef
         }
 
         return mNewAliasButton;
+    }
+
+    private Button getImportAliasButton()
+    {
+        if(mImportAliasButton == null)
+        {
+            mImportAliasButton = new Button("Import");
+            mImportAliasButton.setDisable(true);
+            mImportAliasButton.setMaxWidth(Double.MAX_VALUE);
+            mImportAliasButton.setOnAction(event ->
+            {
+                String aliasListName = getAliasListNameComboBox().getSelectionModel().getSelectedItem();
+
+                if(getAliasListDefinition(aliasListName) == null)
+                {
+                    return;
+                }
+
+                AliasTextImportDialog dialog = new AliasTextImportDialog(mConfigurationManager, aliasListName,
+                    getImportAliasButton().getScene().getWindow());
+                dialog.showAndWait();
+            });
+        }
+
+        return mImportAliasButton;
     }
 
     private Button getDeleteAliasButton()

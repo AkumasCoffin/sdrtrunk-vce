@@ -143,6 +143,57 @@ class ApplicationDatabaseMigratorTest
     }
 
     @Test
+    void migratesAlpha9DatabaseByAddingTheDedupedCallCounter() throws Exception
+    {
+        Path database = newStagedDatabase();
+        SdrTrunkDatabaseStartup.createGlobalDatabase(database);
+
+        try(Connection connection = open(database); var statement = connection.createStatement())
+        {
+            //Rebuild the site activity bucket exactly as Alpha 9 published it, without the deduped counter.
+            String currentSql = scalar(connection,
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='p25_site_activity_bucket'");
+            String alpha9Sql = currentSql.replaceAll("\\s*deduped_call_count INTEGER NOT NULL DEFAULT 0,", "");
+            assertFalse(alpha9Sql.contains("deduped_call_count"));
+            statement.executeUpdate("DROP INDEX idx_p25_site_activity_bucket_time");
+            statement.executeUpdate("DROP TABLE p25_site_activity_bucket");
+            statement.executeUpdate(alpha9Sql);
+            statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_p25_site_activity_bucket_time " +
+                "ON p25_site_activity_bucket(bucket_start_ms)");
+            statement.executeUpdate("""
+                INSERT INTO receiver_context (id, context_key, kind_code, first_seen_ms, last_seen_ms)
+                VALUES (1, 'GUID:alpha9', 1, 1000, 2000)
+                """);
+            statement.executeUpdate("""
+                INSERT INTO p25_site_activity_bucket (context_id, bucket_start_ms, call_count)
+                VALUES (1, 3600000, 3)
+                """);
+            statement.executeUpdate(
+                "DELETE FROM database_metadata WHERE key='deduped_call_metrics_started_at_ms'");
+            SdrTrunkDatabaseStartup.setMetadata(connection, "p25_activity_schema_version", "24");
+        }
+
+        CommandResult result = run(database);
+
+        assertEquals(ApplicationDatabaseMigrator.EXIT_SUCCESS, result.exitCode());
+        assertTrue(result.output().contains("Alpha 9 migration"));
+        assertTrue(result.error().isEmpty());
+
+        try(Connection connection = open(database))
+        {
+            assertEquals(Integer.toString(P25ActivityLogSchema.SCHEMA_VERSION),
+                metadata(connection, "p25_activity_schema_version"));
+            assertTrue(Long.parseLong(metadata(connection, "deduped_call_metrics_started_at_ms")) > 0);
+            assertEquals("3", scalar(connection,
+                "SELECT call_count FROM p25_site_activity_bucket WHERE context_id=1 AND bucket_start_ms=3600000"));
+            assertEquals("0", scalar(connection,
+                "SELECT deduped_call_count FROM p25_site_activity_bucket " +
+                    "WHERE context_id=1 AND bucket_start_ms=3600000"));
+            assertEquals("ok", scalar(connection, "PRAGMA quick_check"));
+        }
+    }
+
+    @Test
     void refusesUnreleasedPredecessorSchemaWithoutRepairingIt() throws Exception
     {
         Path database = newStagedDatabase();

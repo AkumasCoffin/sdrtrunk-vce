@@ -46,7 +46,7 @@ class TrunkedIdentitySchemaTest
         try(Connection connection = open(database))
         {
             P25ActivityLogSchema.validate(connection);
-            assertEquals("24", scalarString(connection, """
+            assertEquals("25", scalarString(connection, """
                 SELECT value FROM database_metadata WHERE key='p25_activity_schema_version'
                 """));
             assertTrue(Long.parseLong(scalarString(connection, """

@@ -682,12 +682,18 @@ class LegacyXmlConfigurationImporterTest
 
         ConfigurationState state = LegacyXmlConfigurationImporter.readConfigurationState(xml);
 
-        assertEquals(1, state.getChannels().size());
-        assertEquals(DecoderType.DMR, state.getChannels().getFirst().getDecodeConfiguration().getDecoderType());
-        assertEquals(1, state.getAliases().size());
-        assertEquals("Current Alias", state.getAliases().getFirst().getName());
-        Talkgroup talkgroup = assertInstanceOf(Talkgroup.class,
+        //AM is active again (airband support restored); LTR/LTR-Net/Passport remain retired and are dropped.
+        assertEquals(2, state.getChannels().size());
+        assertEquals(DecoderType.AM, state.getChannels().getFirst().getDecodeConfiguration().getDecoderType());
+        assertEquals(DecoderType.DMR, state.getChannels().getLast().getDecodeConfiguration().getDecoderType());
+        assertEquals(2, state.getAliases().size());
+        assertEquals("AM Alias", state.getAliases().getFirst().getName());
+        Talkgroup amTalkgroup = assertInstanceOf(Talkgroup.class,
             state.getAliases().getFirst().getMatchIdentifier());
+        assertEquals(Protocol.AM, amTalkgroup.getProtocol());
+        assertEquals("Current Alias", state.getAliases().getLast().getName());
+        Talkgroup talkgroup = assertInstanceOf(Talkgroup.class,
+            state.getAliases().getLast().getMatchIdentifier());
         assertEquals(Protocol.DMR, talkgroup.getProtocol());
     }
 

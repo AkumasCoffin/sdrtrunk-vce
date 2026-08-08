@@ -60,11 +60,21 @@ class ApplicationMigrationServiceTest
         assertTrue(alpha7.requiresMigration());
         assertTrue(alpha7.requiredChanges().contains("Alpha 7"));
 
+        ApplicationMigrationService.MigrationState alpha9 = new ApplicationMigrationService.MigrationState(4,
+            ApplicationMigrationService.ALPHA_9_P25_VERSION, 2, 1);
+        assertTrue(alpha9.supported());
+        assertTrue(alpha9.requiresMigration());
+        assertTrue(alpha9.requiredChanges().contains("deduplicated call counter"));
+
         for(ApplicationMigrationService.MigrationState predecessor: List.of(
             new ApplicationMigrationService.MigrationState(2, 20, 2, null),
             new ApplicationMigrationService.MigrationState(3, 21, 2, 1),
             new ApplicationMigrationService.MigrationState(3, P25ActivityLogSchema.SCHEMA_VERSION, 2, 1),
-            new ApplicationMigrationService.MigrationState(4, P25ActivityLogSchema.SCHEMA_VERSION - 1, 2, 1),
+            new ApplicationMigrationService.MigrationState(4, 23, 2, 1),
+            new ApplicationMigrationService.MigrationState(4,
+                ApplicationMigrationService.ALPHA_9_P25_VERSION, null, 1),
+            new ApplicationMigrationService.MigrationState(4,
+                ApplicationMigrationService.ALPHA_9_P25_VERSION, 2, null),
             new ApplicationMigrationService.MigrationState(4, P25ActivityLogSchema.SCHEMA_VERSION, null, 1),
             new ApplicationMigrationService.MigrationState(4, P25ActivityLogSchema.SCHEMA_VERSION, 2, null)))
         {

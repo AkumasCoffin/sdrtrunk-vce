@@ -297,8 +297,8 @@ class StatsWebInteractionUiContractTest
         assertTrue(html.indexOf("localStorage.getItem('sdrtrunk_theme')") <
             html.indexOf("rel=\"stylesheet\""));
         assertTrue(html.contains("id=\"theme-toggle\""));
-        assertTrue(html.contains("/assets/app.css?v=27"));
-        assertTrue(html.contains("/assets/app.js?v=37"));
+        assertTrue(html.contains("/assets/app.css?v=31"));
+        assertTrue(html.contains("/assets/app.js?v=40"));
         assertTrue(source.contains("window.localStorage.setItem(THEME_STORAGE_KEY"));
         assertTrue(source.contains("toggle.setAttribute('aria-pressed'"));
         assertTrue(css.contains(":root[data-theme=\"dark\"]"));
@@ -334,7 +334,7 @@ class StatsWebInteractionUiContractTest
         assertTrue(ensureAudioContext.contains("this.gainNode.gain.value = this.volume"));
         assertTrue(startCurrent.contains("source.connect(this.gainNode)"));
         assertTrue(css.contains(".playback-volume input:focus-visible"));
-        assertTrue(css.contains("accent-color: #36a99e"));
+        assertTrue(css.contains("accent-color: #5a6cff"));
     }
 
     @Test
@@ -352,6 +352,73 @@ class StatsWebInteractionUiContractTest
         assertTrue(avoidCurrent.contains("if (!this.source || !this.current) return;"));
         assertTrue(render.contains("this.ui.hold.disabled = !this.holdTarget && !activelyPlaying"));
         assertTrue(render.contains("this.ui.avoid.disabled = !activelyPlaying"));
+    }
+
+    @Test
+    void combinesEverySystemInAnAllLiveViewWithAnActiveOnlyFilter() throws Exception
+    {
+        String source = source();
+        String css = Files.readString(APP_CSS);
+        String live = function(source, "function liveSystemsSection()");
+        assertTrue(source.contains("const LIVE_ALL_TABLE_ID = 'all'"));
+        assertTrue(source.contains("const LIVE_ACTIVE_ONLY_STORAGE_KEY = 'sdrtrunk_live_active_only'"));
+        assertTrue(live.contains("tabNodes.set(LIVE_ALL_TABLE_ID, allTab)"));
+        assertTrue(live.contains("`${value.table_id}::${row.key}`"));
+        assertTrue(live.contains("status !== 'IDLE'"));
+        assertTrue(live.contains("'Active only: On'"));
+        assertTrue(live.contains("'No active channels'"));
+        assertTrue(live.contains("allTable.applyUpdate(allCombinedRows())"));
+        assertTrue(live.contains("standardTable.applyUpdate(visibleRows(tables.get(activeTableId)?.rows))"));
+        assertTrue(css.contains(".systems-live-table-all"));
+        assertTrue(css.contains(".section-title-controls"));
+    }
+
+    @Test
+    void marksCallsReceivedAcrossMultipleControlChannels() throws Exception
+    {
+        String live = function(source(), "function liveSystemsSection()");
+        assertTrue(live.contains("const computeMultiSiteCallCounts = () =>"));
+        assertTrue(live.contains("if (tableId === 'conventional') return;"));
+        assertTrue(live.contains("status !== 'CALL' && status !== 'ENCRYPTED'"));
+        assertTrue(live.contains("`${statusText} ×${siteCount}`"));
+        assertTrue(live.contains("This call is being received on ${siteCount} control channels"));
+        assertTrue(live.contains("multiSiteCallCounts = computeMultiSiteCallCounts()"));
+    }
+
+    @Test
+    void attributesActivityToReceivingSitesAndMergesSameCallAcrossSites() throws Exception
+    {
+        String source = source();
+        String label = function(source, "function activitySiteLabel(row)");
+        String merge = function(source, "function mergeActivityRows(rows)");
+        String activity = function(source, "async function renderActivity(scopeParameters, title = 'Activity')");
+        assertTrue(source.contains("const ACTIVITY_SAME_CALL_WINDOW_MS = 5000"));
+        assertTrue(label.contains("row.resolved_channel_name"));
+        assertTrue(label.contains("hex(row.resolved_rfss, 2)"));
+        assertTrue(merge.contains("findSameCallRow(merged, row)"));
+        assertTrue(activity.contains("const multiSite = !scopeParameters.guid && !scopeParameters.context"));
+        assertTrue(activity.contains("mergeActivityRows(initialRows)"));
+        assertTrue(activity.contains("findSameCallRow(activityTable.tableController.rows(), row)"));
+        assertTrue(source.contains("fullLabel: multiSite ? 'Receiving Sites' : 'Receiving Site'"));
+
+        String css = Files.readString(APP_CSS);
+        String sites = function(source, "function activitySitesValue(row)");
+        assertFalse(sites.contains("container.append(', ')"));
+        assertTrue(css.contains(".activity-site {"));
+        assertTrue(css.contains(".activity-sites {"));
+    }
+
+    @Test
+    void keepsTableRulesHorizontalSoWideTablesReadAsRows() throws Exception
+    {
+        String css = Files.readString(APP_CSS);
+        assertTrue(css.contains("th + th {"));
+        assertTrue(css.contains("tbody tr:nth-child(even) {"));
+        assertTrue(css.contains("tbody tr:last-child td {"));
+        assertTrue(css.contains("vertical-align: middle"));
+        assertFalse(css.contains("border-right: 1px solid var(--table-column-rule)"));
+        assertFalse(css.contains("vertical-align: top"));
+        assertTrue(css.indexOf("tbody tr:nth-child(even) {") < css.indexOf("tbody tr:hover {"));
     }
 
     @Test

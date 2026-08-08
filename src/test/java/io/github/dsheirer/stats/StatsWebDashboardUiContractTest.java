@@ -22,6 +22,18 @@ class StatsWebDashboardUiContractTest
     private static final Path APP_CSS = Path.of("stats-web", "assets", "app.css");
 
     @Test
+    void showsDedupedCallsAlongsideRawCallTotals() throws Exception
+    {
+        String source = Files.readString(APP_JAVASCRIPT);
+        String dashboard = function(source, "async function renderDashboard()");
+        assertTrue(source.contains("{ field: 'deduped_call_count', label: 'Deduped' }"));
+        assertTrue(dashboard.contains("dashboardMetricLabel(callActivity, 'deduped_call_count', 'Deduped Calls')"));
+        assertTrue(dashboard.contains("callTotals.deduped_call_count"));
+        assertTrue(dashboard.contains(
+            "'Calls counted once when multiple sites of the same system received the same call'"));
+    }
+
+    @Test
     void separatesCallActivityFromReceiverHealth() throws Exception
     {
         String dashboard = function(Files.readString(APP_JAVASCRIPT), "async function renderDashboard()");

@@ -120,6 +120,8 @@ public final class AliasMatchRegistry
         addProtocolMatchers(descriptors, AliasListFamily.DMR, Protocol.DMR, "DMR");
         addProtocolMatchers(descriptors, AliasListFamily.NXDN, Protocol.NXDN, "NXDN");
         addTalkgroupMatchers(descriptors, AliasListFamily.NBFM, Protocol.NBFM, "NBFM");
+        //AM (airband) shares the conventional-analog NBFM list family
+        addTalkgroupMatchers(descriptors, AliasListFamily.NBFM, Protocol.AM, "AM");
 
         descriptors.add(descriptor("Tone Sequence", AliasIDType.TONES,
             EnumSet.of(AliasListFamily.P25, AliasListFamily.DMR),

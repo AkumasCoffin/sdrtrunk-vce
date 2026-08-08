@@ -50,6 +50,7 @@ const CALL_ACTIVITY_SERIES = Object.freeze([
 ]);
 const DASHBOARD_CALL_METRICS = Object.freeze([
   { field: 'call_count', label: 'Calls' },
+  { field: 'deduped_call_count', label: 'Deduped' },
   { field: 'recorded_count', label: 'Recorded' },
   { field: 'streamed_count', label: 'Sent' }
 ]);
@@ -1580,8 +1581,9 @@ function keyValues(entries) {
 
 function metrics(values, embedded = false) {
   const band = node(embedded ? 'div' : 'section', 'summary-band');
-  values.forEach(([label, value, displayValue]) => {
+  values.forEach(([label, value, displayValue, title]) => {
     const metric = node('div', 'metric');
+    if (title) metric.title = title;
     metric.append(node('span', '', label),
       node('strong', '', displayValue === undefined ? number(value) : displayValue));
     band.append(metric);
@@ -3899,6 +3901,9 @@ async function renderDashboard() {
   content.append(dashboardSummarySection('Call Totals · Last 24 Hours', [
     [dashboardMetricLabel(callActivity, 'call_count', 'Calls'), callTotals.call_count,
       dashboardMetricDisplay(callActivity, 'call_count')],
+    [dashboardMetricLabel(callActivity, 'deduped_call_count', 'Deduped Calls'), callTotals.deduped_call_count,
+      dashboardMetricDisplay(callActivity, 'deduped_call_count'),
+      'Calls counted once when multiple sites of the same system received the same call'],
     [dashboardMetricLabel(callActivity, 'recorded_count', 'Recorded'), callTotals.recorded_count,
       dashboardMetricDisplay(callActivity, 'recorded_count')],
     [dashboardMetricLabel(callActivity, 'streamed_count', 'Sent'), callTotals.streamed_count,
@@ -3920,10 +3925,12 @@ async function renderDashboard() {
   content.lastChild.append(destinations, sources);
 }
 
+const LIVE_ALL_TABLE_ID = 'all';
+const LIVE_ACTIVE_ONLY_STORAGE_KEY = 'sdrtrunk_live_active_only';
+
 function liveSystemsSection() {
   const tables = new Map();
   const tabNodes = new Map();
-  const rowNodes = new Map();
   const decodeDisplay = serviceStatus?.decodeDisplay || { showControl: true, showVoice: true, mode: 'percentage' };
   const compactQualityCount = (value) => {
     const count = Number(value || 0);
@@ -3983,7 +3990,57 @@ function liveSystemsSection() {
     }
     return values.join('\n');
   };
-  const columns = [
+  let activeTableId = null;
+  let activeOnly = false;
+  try {
+    activeOnly = window.localStorage.getItem(LIVE_ACTIVE_ONLY_STORAGE_KEY) === 'true';
+  } catch (error) {
+    // Browser storage can be disabled; the filter simply starts off.
+  }
+
+  const isActiveRow = (row) => {
+    const status = String(row.status || '').trim().toUpperCase();
+    return Boolean(status) && status !== 'IDLE';
+  };
+  const visibleRows = (rows) => activeOnly ? (rows || []).filter(isActiveRow) : (rows || []);
+
+  let multiSiteCallCounts = new Map();
+  const activeCallSignature = (row) => {
+    const status = String(row.status || '').trim().toUpperCase();
+    if (status !== 'CALL' && status !== 'ENCRYPTED') return null;
+    const target = identifierNumber(row.target_id);
+    if (!target) return null;
+    return `${target}|${identifierNumber(row.source_id) || ''}`;
+  };
+  const computeMultiSiteCallCounts = () => {
+    const counts = new Map();
+    tables.forEach((value, tableId) => {
+      if (tableId === 'conventional') return;
+      const seen = new Set();
+      (value.rows || []).forEach((row) => {
+        const signature = activeCallSignature(row);
+        if (!signature || seen.has(signature)) return;
+        seen.add(signature);
+        counts.set(signature, (counts.get(signature) || 0) + 1);
+      });
+    });
+    return counts;
+  };
+  const multiSiteCallCount = (row) => {
+    const signature = activeCallSignature(row);
+    return signature ? multiSiteCallCounts.get(signature) || 0 : 0;
+  };
+  const emptyMessage = () => activeOnly ? 'No active channels' : 'No channels observed';
+  const systemTitle = (value) => value.title || value.channel_name || value.table_id;
+  const combinedRowsFor = (value) => visibleRows(value.rows).map((row) =>
+    ({ ...row, key: `${value.table_id}::${row.key}`, system_title: systemTitle(value) }));
+  const allCombinedRows = () => [...tables.values()]
+    .sort((left, right) => String(systemTitle(left)).localeCompare(String(systemTitle(right))))
+    .flatMap(combinedRowsFor);
+  const currentRows = () => activeTableId === LIVE_ALL_TABLE_ID ? allCombinedRows() :
+    visibleRows(tables.get(activeTableId)?.rows);
+
+  const baseColumns = () => [
     { id: 'status', label: 'Status', width: 145, sortValue: (row) => row.status || '' },
     { id: 'tags', label: 'Tags', width: 180, sortValue: channelTagText },
     { id: 'channel-lcn', label: 'LCN', width: 130, sortValue: (row) =>
@@ -4001,168 +4058,227 @@ function liveSystemsSection() {
     { id: 'target', label: 'Tgt ID', fullLabel: 'Target ID', width: 105, sortValue: (row) => Number(row.target_id || 0) },
     { id: 'decoder', label: 'Decoder', width: 80, sortValue: (row) => row.decoder || '' }
   ];
-  const tabBar = node('div', 'systems-live-tabs');
-  const connection = badge('Connecting', 'state-stale');
-  const tableElement = node('table', 'data-table systems-live-table resizable-table');
-  tableElement.dataset.tableType = 'live-systems';
-  const columnGroup = node('colgroup');
-  const columnElements = columns.map(() => node('col'));
-  columnGroup.append(...columnElements);
-  const head = node('thead');
-  const headerRow = node('tr');
-  const headers = [];
-  let liveSort = null;
-  columns.forEach((column) => {
-    const header = node('th');
-    header.title = column.fullLabel || column.label;
-    const control = node('button', 'table-sort-control', column.label);
-    control.type = 'button';
-    control.addEventListener('click', () => {
-      liveSort = liveSort?.column === column ?
-        { column, direction: liveSort.direction === 'asc' ? 'desc' : 'asc' } :
-        { column, direction: 'asc' };
-      headers.forEach((candidate, index) => candidate.setAttribute('aria-sort',
-        columns[index] === liveSort.column ? (liveSort.direction === 'asc' ? 'ascending' : 'descending') : 'none'));
-      const value = tables.get(activeTableId);
-      if (value) reorderVisibleRows(value.rows || []);
+
+  const createLiveTable = (includeSystem) => {
+    const columns = includeSystem ? [
+      { id: 'system', label: 'System', width: 190, sortValue: (row) => row.system_title || '' },
+      ...baseColumns()
+    ] : baseColumns();
+    const tableType = includeSystem ? 'live-systems-all' : 'live-systems';
+    const tableElement = node('table', includeSystem ?
+      'data-table systems-live-table systems-live-table-all resizable-table' :
+      'data-table systems-live-table resizable-table');
+    tableElement.dataset.tableType = tableType;
+    const columnGroup = node('colgroup');
+    const columnElements = columns.map(() => node('col'));
+    columnGroup.append(...columnElements);
+    const head = node('thead');
+    const headerRow = node('tr');
+    const headers = [];
+    let liveSort = null;
+    columns.forEach((column) => {
+      const header = node('th');
+      header.title = column.fullLabel || column.label;
+      const control = node('button', 'table-sort-control', column.label);
+      control.type = 'button';
+      control.addEventListener('click', () => {
+        liveSort = liveSort?.column === column ?
+          { column, direction: liveSort.direction === 'asc' ? 'desc' : 'asc' } :
+          { column, direction: 'asc' };
+        headers.forEach((candidate, index) => candidate.setAttribute('aria-sort',
+          columns[index] === liveSort.column ? (liveSort.direction === 'asc' ? 'ascending' : 'descending') : 'none'));
+        reorderVisibleRows(currentRows());
+      });
+      header.setAttribute('aria-sort', 'none');
+      header.append(control);
+      headers.push(header);
+      headerRow.append(header);
     });
-    header.setAttribute('aria-sort', 'none');
-    header.append(control);
-    headers.push(header);
-    headerRow.append(header);
-  });
-  head.append(headerRow);
-  const body = node('tbody');
-  tableElement.append(columnGroup, head, body);
-  applyPreferredTableWidths(tableElement, columns, columnElements, 'live-systems');
-  addColumnResizers(tableElement, columns, columnElements, headers, 'live-systems');
-  const tableScroll = node('div', 'table-scroll');
-  tableScroll.append(tableElement);
-  const host = node('div', 'systems-live');
-  host.append(tabBar, tableScroll);
-  const block = section('Live Systems', host);
-  block.querySelector('.section-title').append(connection);
-  let activeTableId = null;
-  let selectedRowKey = null;
+    head.append(headerRow);
+    const body = node('tbody');
+    tableElement.append(columnGroup, head, body);
+    applyPreferredTableWidths(tableElement, columns, columnElements, tableType);
+    addColumnResizers(tableElement, columns, columnElements, headers, tableType);
+    const scroll = node('div', 'table-scroll');
+    scroll.append(tableElement);
+    const rowNodes = new Map();
+    let selectedRowKey = null;
 
-  const cellText = (cell, value) => {
-    const text = value === null || value === undefined ? '' : String(value);
-    if (cell.textContent !== text) cell.textContent = text;
-  };
+    const cellText = (cell, value) => {
+      const text = value === null || value === undefined ? '' : String(value);
+      if (cell.textContent !== text) cell.textContent = text;
+    };
 
-  const updateRow = (element, row) => {
-    const cells = element.children;
-    const conventional = channelTagSet(row.tags).has('CONVENTIONAL');
-    const statusText = row.status === 'ENCRYPTED' && row.encryption_details ? row.encryption_details : row.status;
-    cellText(cells[0], statusText);
-    cellText(cells[1], channelTagText(row));
-    cellText(cells[2], conventional ? row.channel_name : row.lcn);
-    cellText(cells[3], frequency(row.frequency_hz));
-    cellText(cells[4], row.signal_dbfs == null ? '' : `${Number(row.signal_dbfs).toFixed(1)} dBFS`);
-    cellText(cells[5], decodeQualityText(row));
-    cellText(cells[6], row.source_alias_display || row.source_alias ||
-      (row.talker_alias ? `TA: ${row.talker_alias}` : ''));
-    cellText(cells[7], row.source_id);
-    cellText(cells[8], row.target_alias);
-    cellText(cells[9], row.target_id);
-    cellText(cells[10], decoderLabel(row.decoder, true));
-    cells[1].title = channelTagTitle(row);
-    cells[2].title = conventional ? (row.channel_name || '') : '';
-    cells[0].className = `activity-status state-${String(row.status || 'idle').toLowerCase()}`;
-    cells[1].className = '';
-    const tags = channelTagSet(row.tags);
-    cells[2].className = tags.has('CURRENT_CONTROL') ? 'control-current' :
-      (tags.has('ALTERNATE_CONTROL') ? 'control-alternate' : '');
-    cells[3].className = cells[2].className;
-    cells[4].className = cells[2].className;
-    cells[5].title = decodeQualityTitle(row);
-    cells[10].title = decoderLabel(row.decoder);
-    const decodeValues = decodeQualityValues(row);
-    const decodePercent = decodeValues.length ? Math.min(...decodeValues) : null;
-    cells[5].className = decodePercent == null ? '' :
-      (decodePercent >= DECODE_HEALTHY_MINIMUM_PERCENT ? 'quality-good' :
-        (decodePercent >= DECODE_DEGRADED_MINIMUM_PERCENT ?
-          'quality-warn' : 'quality-bad'));
-    element.classList.toggle('selected', selectedRowKey === row.key);
-  };
+    const updateRow = (element, row) => {
+      let cells = element.children;
+      if (includeSystem) {
+        cellText(cells[0], row.system_title);
+        cells[0].title = row.system_title || '';
+        cells = [...element.children].slice(1);
+      }
+      const conventional = channelTagSet(row.tags).has('CONVENTIONAL');
+      const statusText = row.status === 'ENCRYPTED' && row.encryption_details ? row.encryption_details : row.status;
+      const siteCount = multiSiteCallCount(row);
+      cellText(cells[0], siteCount > 1 ? `${statusText} ×${siteCount}` : statusText);
+      cells[0].title = siteCount > 1 ?
+        `This call is being received on ${siteCount} control channels` : '';
+      cellText(cells[1], channelTagText(row));
+      cellText(cells[2], conventional ? row.channel_name : row.lcn);
+      cellText(cells[3], frequency(row.frequency_hz));
+      cellText(cells[4], row.signal_dbfs == null ? '' : `${Number(row.signal_dbfs).toFixed(1)} dBFS`);
+      cellText(cells[5], decodeQualityText(row));
+      cellText(cells[6], row.source_alias_display || row.source_alias ||
+        (row.talker_alias ? `TA: ${row.talker_alias}` : ''));
+      cellText(cells[7], row.source_id);
+      cellText(cells[8], row.target_alias);
+      cellText(cells[9], row.target_id);
+      cellText(cells[10], decoderLabel(row.decoder, true));
+      cells[1].title = channelTagTitle(row);
+      cells[2].title = conventional ? (row.channel_name || '') : '';
+      cells[0].className = `activity-status state-${String(row.status || 'idle').toLowerCase()}`;
+      cells[1].className = '';
+      const tags = channelTagSet(row.tags);
+      cells[2].className = tags.has('CURRENT_CONTROL') ? 'control-current' :
+        (tags.has('ALTERNATE_CONTROL') ? 'control-alternate' : '');
+      cells[3].className = cells[2].className;
+      cells[4].className = cells[2].className;
+      cells[5].title = decodeQualityTitle(row);
+      cells[10].title = decoderLabel(row.decoder);
+      const decodeValues = decodeQualityValues(row);
+      const decodePercent = decodeValues.length ? Math.min(...decodeValues) : null;
+      cells[5].className = decodePercent == null ? '' :
+        (decodePercent >= DECODE_HEALTHY_MINIMUM_PERCENT ? 'quality-good' :
+          (decodePercent >= DECODE_DEGRADED_MINIMUM_PERCENT ?
+            'quality-warn' : 'quality-bad'));
+      element.classList.toggle('selected', selectedRowKey === row.key);
+    };
 
-  const createRow = (row) => {
-    const element = node('tr');
-    element.dataset.key = row.key;
-    for (let index = 0; index < 11; index += 1) element.append(node('td'));
-    element.addEventListener('click', () => {
-      selectedRowKey = row.key;
-      rowNodes.forEach((candidate, key) => candidate.classList.toggle('selected', key === selectedRowKey));
-    });
-    updateRow(element, row);
-    return element;
-  };
+    const createRow = (row) => {
+      const element = node('tr');
+      element.dataset.key = row.key;
+      for (let index = 0; index < columns.length; index += 1) element.append(node('td'));
+      element.addEventListener('click', () => {
+        selectedRowKey = row.key;
+        rowNodes.forEach((candidate, key) => candidate.classList.toggle('selected', key === selectedRowKey));
+      });
+      updateRow(element, row);
+      return element;
+    };
 
-  const orderedLiveRows = (rows) => liveSort ? [...rows].sort((left, right) => {
-    const result = compareTableValues(liveSort.column.sortValue(left), liveSort.column.sortValue(right));
-    return liveSort.direction === 'asc' ? result : -result;
-  }) : rows;
+    const orderedLiveRows = (rows) => liveSort ? [...rows].sort((left, right) => {
+      const result = compareTableValues(liveSort.column.sortValue(left), liveSort.column.sortValue(right));
+      return liveSort.direction === 'asc' ? result : -result;
+    }) : rows;
 
-  const reorderVisibleRows = (rows) => {
-    orderedLiveRows(rows).forEach((row) => {
-      const element = rowNodes.get(row.key);
-      if (element) body.append(element);
-    });
-  };
+    const reorderVisibleRows = (rows) => {
+      orderedLiveRows(rows).forEach((row) => {
+        const element = rowNodes.get(row.key);
+        if (element) body.append(element);
+      });
+    };
 
-  const showTable = (tableId) => {
-    const value = tables.get(tableId);
-    if (!value) return;
-    activeTableId = tableId;
-    selectedRowKey = null;
-    rowNodes.clear();
-    body.replaceChildren();
-    headers[2].querySelector('.table-sort-control').textContent =
-      tableId === 'conventional' ? 'Channel' : 'LCN';
-    orderedLiveRows(value.rows || []).forEach((row) => {
-      const element = createRow(row);
-      rowNodes.set(row.key, element);
-      body.append(element);
-    });
-    if (!value.rows?.length) {
+    const appendEmpty = () => {
       const empty = node('tr', 'empty');
-      const message = node('td', '', 'No channels observed');
+      const message = node('td', '', emptyMessage());
       message.colSpan = columns.length;
       empty.append(message);
       body.append(empty);
+    };
+
+    const setRows = (rows) => {
+      selectedRowKey = null;
+      rowNodes.clear();
+      body.replaceChildren();
+      orderedLiveRows(rows || []).forEach((row) => {
+        const element = createRow(row);
+        rowNodes.set(row.key, element);
+        body.append(element);
+      });
+      if (!rowNodes.size) appendEmpty();
+    };
+
+    const applyUpdate = (rows, scopePrefix = null) => {
+      const incoming = new Map((rows || []).map((row) => [row.key, row]));
+      body.querySelector('.empty')?.remove();
+      rowNodes.forEach((element, key) => {
+        if ((!scopePrefix || String(key).startsWith(scopePrefix)) && !incoming.has(key)) {
+          element.remove();
+          rowNodes.delete(key);
+        }
+      });
+      (rows || []).forEach((row) => {
+        let element = rowNodes.get(row.key);
+        if (!element) {
+          element = createRow(row);
+          rowNodes.set(row.key, element);
+          body.append(element);
+        } else {
+          updateRow(element, row);
+        }
+      });
+      if (liveSort) reorderVisibleRows(currentRows());
+      if (!rowNodes.size) appendEmpty();
+    };
+
+    return { headers, scroll, setRows, applyUpdate };
+  };
+
+  const standardTable = createLiveTable(false);
+  const allTable = createLiveTable(true);
+  allTable.scroll.hidden = true;
+  const tabBar = node('div', 'systems-live-tabs');
+  const connection = badge('Connecting', 'state-stale');
+  const host = node('div', 'systems-live');
+  host.append(tabBar, standardTable.scroll, allTable.scroll);
+  const block = section('Live Systems', host);
+
+  const activeToggle = node('button', 'button secondary live-active-toggle');
+  activeToggle.type = 'button';
+  const updateActiveToggle = () => {
+    activeToggle.textContent = activeOnly ? 'Active only: On' : 'Active only: Off';
+    activeToggle.setAttribute('aria-pressed', String(activeOnly));
+  };
+  updateActiveToggle();
+  activeToggle.addEventListener('click', () => {
+    activeOnly = !activeOnly;
+    try {
+      window.localStorage.setItem(LIVE_ACTIVE_ONLY_STORAGE_KEY, String(activeOnly));
+    } catch (error) {
+      // Browser storage can be disabled; the filter still applies for this page view.
+    }
+    updateActiveToggle();
+    if (activeTableId) showTable(activeTableId);
+  });
+  const titleControls = node('span', 'section-title-controls');
+  titleControls.append(activeToggle, connection);
+  block.querySelector('.section-title').append(titleControls);
+
+  const showTable = (tableId) => {
+    if (tableId !== LIVE_ALL_TABLE_ID && !tables.get(tableId)) return;
+    activeTableId = tableId;
+    const all = tableId === LIVE_ALL_TABLE_ID;
+    standardTable.scroll.hidden = all;
+    allTable.scroll.hidden = !all;
+    if (all) {
+      allTable.setRows(allCombinedRows());
+    } else {
+      standardTable.headers[2].querySelector('.table-sort-control').textContent =
+        tableId === 'conventional' ? 'Channel' : 'LCN';
+      standardTable.setRows(visibleRows(tables.get(tableId).rows));
     }
     tabNodes.forEach((tab, id) => tab.classList.toggle('active', id === activeTableId));
   };
 
-  const updateVisibleRows = (value) => {
-    if (value.table_id !== activeTableId) return;
-    const incoming = new Map((value.rows || []).map((row) => [row.key, row]));
-    body.querySelector('.empty')?.remove();
-    rowNodes.forEach((element, key) => {
-      if (!incoming.has(key)) {
-        element.remove();
-        rowNodes.delete(key);
-      }
-    });
-    (value.rows || []).forEach((row) => {
-      let element = rowNodes.get(row.key);
-      if (!element) {
-        element = createRow(row);
-        rowNodes.set(row.key, element);
-        body.append(element);
-      } else {
-        updateRow(element, row);
-      }
-    });
-    if (liveSort) reorderVisibleRows(value.rows || []);
-    if (!rowNodes.size) {
-      const empty = node('tr', 'empty');
-      const message = node('td', '', 'No channels observed');
-      message.colSpan = columns.length;
-      empty.append(message);
-      body.append(empty);
-    }
-  };
+  const allTab = node('button', 'systems-live-tab');
+  allTab.type = 'button';
+  const allQuality = node('span', 'systems-tab-quality quality-neutral');
+  for (let index = 0; index < 4; index += 1) allQuality.append(node('span'));
+  allTab.append(allQuality, node('span', 'systems-tab-label', 'All'));
+  allTab.title = 'Every system in one view';
+  allTab.setAttribute('aria-label', 'All systems');
+  allTab.addEventListener('click', () => showTable(LIVE_ALL_TABLE_ID));
+  tabNodes.set(LIVE_ALL_TABLE_ID, allTab);
+  tabBar.append(allTab);
 
   const upsertTable = (value) => {
     if (!value?.table_id) return;
@@ -4212,19 +4328,24 @@ function liveSystemsSection() {
       tab.title = `${label} · ${signalLabel} · ${qualityLabel}`;
       tab.setAttribute('aria-label', `${label}, ${signalLabel}, ${qualityLabel}`);
     }
+    multiSiteCallCounts = computeMultiSiteCallCounts();
     if (!activeTableId) showTable(tables.has('conventional') ? 'conventional' : value.table_id);
-    else updateVisibleRows(value);
+    else if (activeTableId === LIVE_ALL_TABLE_ID) allTable.applyUpdate(allCombinedRows());
+    else standardTable.applyUpdate(visibleRows(tables.get(activeTableId)?.rows));
   };
 
   const removeTable = (tableId) => {
     tables.delete(tableId);
     tabNodes.get(tableId)?.remove();
     tabNodes.delete(tableId);
-    if (activeTableId === tableId) {
+    multiSiteCallCounts = computeMultiSiteCallCounts();
+    if (activeTableId === LIVE_ALL_TABLE_ID) {
+      allTable.applyUpdate(allCombinedRows());
+    } else if (activeTableId === tableId) {
       activeTableId = null;
       const next = tables.has('conventional') ? 'conventional' : tables.keys().next().value;
       if (next) showTable(next);
-      else body.replaceChildren();
+      else standardTable.setRows([]);
     }
   };
 
@@ -5010,11 +5131,85 @@ function activityTargetAlias(row) {
   return alias;
 }
 
-function activityColumns() {
-  return [
+const ACTIVITY_SAME_CALL_WINDOW_MS = 5000;
+
+function activitySiteLabel(row) {
+  if (row.resolved_channel_name) return row.resolved_channel_name;
+  if (isP25(row)) {
+    const rfss = hex(row.resolved_rfss, 2);
+    const site = hex(row.resolved_site, 2);
+    if (rfss && site) return `${rfss}-${site}`;
+  }
+  const site = identifierNumber(row.resolved_site);
+  if (site) return `Site ${site}`;
+  return row.context_key || '';
+}
+
+function activitySiteEntry(row) {
+  return { guid: row.guid || row.context_key || '', label: activitySiteLabel(row),
+    frequency_hz: row.frequency_hz, lcn: row.lcn };
+}
+
+function activitySiteEntries(row) {
+  return row.sites || [activitySiteEntry(row)];
+}
+
+function activitySitesValue(row) {
+  const entries = activitySiteEntries(row);
+  const container = node('span', 'activity-sites');
+  entries.forEach((site) => {
+    const value = node('span', 'activity-site', site.label || '');
+    const megahertz = frequency(site.frequency_hz);
+    value.title = [site.label || 'Unknown site', megahertz ? `${megahertz} MHz` : '',
+      site.lcn ? `LCN ${site.lcn}` : ''].filter(Boolean).join(' · ');
+    container.append(value);
+  });
+  return container;
+}
+
+function activityCallKey(row) {
+  return [protocolFamily(row), row.action || '', row.event_type || '', row.source_radio_id ?? '',
+    row.target_id ?? '', row.target_kind_code ?? '', row.encrypted ? 1 : 0].join('|');
+}
+
+function activityMergeRow(row) {
+  return { ...row, sites: activitySiteEntries(row) };
+}
+
+function mergeActivitySite(target, row) {
+  const entry = activitySiteEntry(row);
+  if (!target.sites.some((site) => site.guid === entry.guid)) {
+    target.sites.push(entry);
+    target.sites.sort((left, right) => String(left.label).localeCompare(String(right.label)));
+  }
+}
+
+function findSameCallRow(rows, row) {
+  return (rows || []).find((candidate) => candidate.sites &&
+    activityCallKey(candidate) === activityCallKey(row) &&
+    Math.abs(Number(candidate.observed_at_ms || 0) - Number(row.observed_at_ms || 0)) <=
+      ACTIVITY_SAME_CALL_WINDOW_MS);
+}
+
+function mergeActivityRows(rows) {
+  const merged = [];
+  (rows || []).forEach((row) => {
+    const match = findSameCallRow(merged, row);
+    if (match) mergeActivitySite(match, row);
+    else merged.push(activityMergeRow(row));
+  });
+  return merged;
+}
+
+function activityColumns({ includeSites = false, multiSite = false } = {}) {
+  const columns = [
     { id: 'time', label: 'Seen', fullLabel: 'Observed Time', render: (row) => dateTime(row.observed_at_ms), sortValue: (row) => Number(row.observed_at_ms || 0) },
     { label: 'Action', key: 'action' },
     { label: 'Event', key: 'event_type' },
+    ...(includeSites ? [{ id: 'sites', label: multiSite ? 'Sites' : 'Site',
+      fullLabel: multiSite ? 'Receiving Sites' : 'Receiving Site', className: 'alias-cell',
+      render: activitySitesValue,
+      sortValue: (row) => activitySiteEntries(row).map((site) => site.label).join(', ') }] : []),
     { id: 'source', label: 'Src', fullLabel: 'Source ID',
       render: (row) => activityIdentifier(row, row.source_radio_id, 'radio'),
       className: 'numeric identifier-cell', sortValue: (row) => Number(row.source_radio_id || 0) },
@@ -5031,6 +5226,7 @@ function activityColumns() {
     { id: 'encryption', label: 'Enc', fullLabel: 'Encryption', render: encryptionActivityValue,
       className: 'encrypted', sortValue: (row) => row.encryption_display || (row.encrypted ? 'ENC' : '') }
   ];
+  return columns;
 }
 
 async function renderActivity(scopeParameters, title = 'Activity') {
@@ -5045,9 +5241,12 @@ async function renderActivity(scopeParameters, title = 'Activity') {
     hide_grants: true,
     limit: 200
   });
-  const columns = activityColumns();
-  const activityTable = table(withoutGrantActions(data.rows), columns, 'No activity recorded',
-    { type: 'activity', rowKey: (row) => row.id });
+  const multiSite = !scopeParameters.guid && !scopeParameters.context;
+  const includeSites = !scopeParameters.context;
+  const columns = activityColumns({ includeSites, multiSite });
+  const initialRows = withoutGrantActions(data.rows);
+  const activityTable = table(multiSite ? mergeActivityRows(initialRows) : initialRows, columns,
+    'No activity recorded', { type: 'activity', rowKey: (row) => row.id });
   const block = section(title, activityTable);
   const controls = node('div', 'pager');
   controls.append(route.get('before_id') ? anchor('Newest', currentHref({ before_id: null }), 'button secondary') :
@@ -5073,6 +5272,16 @@ async function renderActivity(scopeParameters, title = 'Activity') {
       pause.setAttribute('aria-pressed', String(paused));
     };
     const addActivityRow = (row) => {
+      if (multiSite) {
+        const existing = findSameCallRow(activityTable.tableController.rows(), row);
+        if (existing) {
+          mergeActivitySite(existing, row);
+          activityTable.tableController.upsertRow(existing, { prepend: true, limit: 200 });
+          return;
+        }
+        activityTable.tableController.upsertRow(activityMergeRow(row), { prepend: true, limit: 200 });
+        return;
+      }
       activityTable.tableController.upsertRow(row, { prepend: true, limit: 200 });
     };
     pause.addEventListener('click', () => {

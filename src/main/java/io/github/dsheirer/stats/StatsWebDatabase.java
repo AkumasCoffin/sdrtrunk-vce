@@ -69,7 +69,8 @@ class StatsWebDatabase
             SUM(bucket.call_count) AS call_count,
             SUM(bucket.recorded_count) AS recorded_count,
             SUM(bucket.streamed_count) AS streamed_count,
-            SUM(bucket.encrypted_count) AS encrypted_count
+            SUM(bucket.encrypted_count) AS encrypted_count,
+            SUM(bucket.deduped_call_count) AS deduped_call_count
         FROM p25_site_activity_bucket AS bucket INDEXED BY idx_p25_site_activity_bucket_time
         JOIN receiver_context context ON context.id = bucket.context_id
         WHERE bucket.bucket_start_ms >= ? AND bucket.bucket_start_ms < ?
@@ -92,7 +93,8 @@ class StatsWebDatabase
             SUM(bucket.call_count) AS call_count,
             SUM(bucket.recorded_count) AS recorded_count,
             SUM(bucket.streamed_count) AS streamed_count,
-            SUM(bucket.encrypted_count) AS encrypted_count
+            SUM(bucket.encrypted_count) AS encrypted_count,
+            SUM(bucket.call_count) AS deduped_call_count
         FROM receiver_context context
         JOIN conventional_activity_bucket AS bucket INDEXED BY idx_conventional_bucket_dashboard_time
             ON bucket.context_id = context.id
@@ -275,6 +277,10 @@ class StatsWebDatabase
     private static final int DIRECTORY_SITE_LIMIT_PER_SYSTEM = 500;
     private static final List<String> CALL_ACTIVITY_FIELDS = List.of(
         "call_count", "recorded_count", "streamed_count", "encrypted_count"
+    );
+    //Dashboard totals also report cross-site deduplicated calls, which identity buckets do not carry.
+    private static final List<String> DASHBOARD_CALL_ACTIVITY_FIELDS = List.of(
+        "call_count", "deduped_call_count", "recorded_count", "streamed_count", "encrypted_count"
     );
     private static final List<CallActivityGroup> CALL_ACTIVITY_GROUPS = List.of(
         new CallActivityGroup(1, "P25", "TRUNKED", true),
@@ -3033,6 +3039,7 @@ class StatsWebDatabase
         long nextHour = currentHour + HOUR_MILLISECONDS;
         long p25OutputMetricStart = p25CallOutputMetricsStartedAt(connection);
         long allModeMetricStart = allModeCallOutputMetricsStartedAt(connection);
+        long dedupedCallMetricStart = dedupedCallMetricsStartedAt(connection);
         List<Map<String,Object>> stored = queryRows(connection, DASHBOARD_CALL_ACTIVITY_SQL,
             firstHour, nextHour, firstHour, nextHour);
         Map<String,Map<Long,Map<String,Object>>> storedByGroupAndTime = new LinkedHashMap<>();
@@ -3051,7 +3058,7 @@ class StatsWebDatabase
 
         Map<String,Object> totals = new LinkedHashMap<>();
 
-        for(String field: CALL_ACTIVITY_FIELDS)
+        for(String field: DASHBOARD_CALL_ACTIVITY_FIELDS)
         {
             totals.put(field, 0L);
         }
@@ -3062,10 +3069,10 @@ class StatsWebDatabase
         for(CallActivityGroup group: CALL_ACTIVITY_GROUPS)
         {
             Map<String,Object> coverage = callActivityCoverage(group, p25OutputMetricStart,
-                allModeMetricStart, firstHour, now);
+                allModeMetricStart, dedupedCallMetricStart, firstHour, now);
             Map<String,Object> groupTotals = new LinkedHashMap<>();
 
-            for(String field: CALL_ACTIVITY_FIELDS)
+            for(String field: DASHBOARD_CALL_ACTIVITY_FIELDS)
             {
                 groupTotals.put(field, "NOT_COLLECTED".equals(coverage.get(field)) ? null : 0L);
             }
@@ -3082,11 +3089,11 @@ class StatsWebDatabase
                 point.put("protocol", group.protocol());
                 point.put("channel_kind", group.channelKind());
 
-                for(String field: CALL_ACTIVITY_FIELDS)
+                for(String field: DASHBOARD_CALL_ACTIVITY_FIELDS)
                 {
                     String fieldCoverage = String.valueOf(coverage.get(field));
                     long metricStart = callActivityMetricStartedAt(group, field, p25OutputMetricStart,
-                        allModeMetricStart);
+                        allModeMetricStart, dedupedCallMetricStart);
                     boolean beforeMetricCollection = metricStart > 0 &&
                         timestamp + HOUR_MILLISECONDS <= metricStart;
                     Object value;
@@ -3129,9 +3136,9 @@ class StatsWebDatabase
             coverageRow.put("protocol", group.get("protocol"));
             coverageRow.put("channel_kind", group.get("channel_kind"));
             coverageRow.putAll(groupCoverage);
-            boolean noneCollected = CALL_ACTIVITY_FIELDS.stream()
+            boolean noneCollected = DASHBOARD_CALL_ACTIVITY_FIELDS.stream()
                 .allMatch(field -> "NOT_COLLECTED".equals(groupCoverage.get(field)));
-            boolean fullyCollected = CALL_ACTIVITY_FIELDS.stream()
+            boolean fullyCollected = DASHBOARD_CALL_ACTIVITY_FIELDS.stream()
                 .allMatch(field -> "COLLECTED".equals(groupCoverage.get(field)));
             coverageRow.put("status", fullyCollected ? "COLLECTED" :
                 noneCollected ? "NOT_COLLECTED" : "PARTIAL");
@@ -3140,7 +3147,7 @@ class StatsWebDatabase
 
         Map<String,Object> metricCoverage = new LinkedHashMap<>();
 
-        for(String field: CALL_ACTIVITY_FIELDS)
+        for(String field: DASHBOARD_CALL_ACTIVITY_FIELDS)
         {
             boolean anyCollected = breakdown.stream()
                 .map(row -> mapValue(row, "coverage"))
@@ -3172,14 +3179,15 @@ class StatsWebDatabase
     }
 
     private static Map<String,Object> callActivityCoverage(CallActivityGroup group, long p25OutputMetricStart,
-                                                            long allModeMetricStart, long firstHour, long now)
+                                                            long allModeMetricStart, long dedupedCallMetricStart,
+                                                            long firstHour, long now)
     {
         Map<String,Object> coverage = new LinkedHashMap<>();
 
-        for(String field: CALL_ACTIVITY_FIELDS)
+        for(String field: DASHBOARD_CALL_ACTIVITY_FIELDS)
         {
             long metricStart = callActivityMetricStartedAt(group, field, p25OutputMetricStart,
-                allModeMetricStart);
+                allModeMetricStart, dedupedCallMetricStart);
             String status;
 
             if(!group.collected() || metricStart < 0 || metricStart > now)
@@ -3207,11 +3215,19 @@ class StatsWebDatabase
      * introduced with the all-mode output metrics, so earlier empty buckets must not be presented as observed zeros.
      */
     private static long callActivityMetricStartedAt(CallActivityGroup group, String field,
-                                                     long p25OutputMetricStart, long allModeMetricStart)
+                                                     long p25OutputMetricStart, long allModeMetricStart,
+                                                     long dedupedCallMetricStart)
     {
         if(!group.collected())
         {
             return -1;
+        }
+
+        //Trunked deduped counts began with their own schema; conventional channels have no cross-site
+        //duplication, so their deduped counts share the call_count coverage rules below.
+        if("deduped_call_count".equals(field) && "TRUNKED".equals(group.channelKind()))
+        {
+            return dedupedCallMetricStart > 0 ? dedupedCallMetricStart : -1;
         }
 
         if("recorded_count".equals(field) || "streamed_count".equals(field))
@@ -3275,6 +3291,13 @@ class StatsWebDatabase
         return scalarLong(connection, """
             SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM database_metadata WHERE key = ?), 0)
             """, P25ActivityLogSchema.TRUNKED_IDENTITY_METRICS_STARTED_AT_KEY);
+    }
+
+    private static long dedupedCallMetricsStartedAt(Connection connection) throws SQLException
+    {
+        return scalarLong(connection, """
+            SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM database_metadata WHERE key = ?), 0)
+            """, P25ActivityLogSchema.DEDUPED_CALL_METRICS_STARTED_AT_KEY);
     }
 
     private static int targetKind(StatsRequest request)

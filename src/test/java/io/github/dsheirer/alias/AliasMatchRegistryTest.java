@@ -104,9 +104,9 @@ class AliasMatchRegistryTest
             labels(AliasListFamily.DMR));
         assertEquals(Set.of("NXDN Talkgroup", "NXDN Talkgroup Range", "NXDN Radio ID", "NXDN Radio ID Range"),
             labels(AliasListFamily.NXDN));
-        assertEquals(Set.of("NBFM Talkgroup", "NBFM Talkgroup Range", "Digital Coded Squelch (DCS)",
-                "Fleetsync Talkgroup", "Fleetsync Talkgroup Range", "MDC-1200 Talkgroup",
-                "MDC-1200 Talkgroup Range", "LoJack Transponder ESN", "User Status"),
+        assertEquals(Set.of("NBFM Talkgroup", "NBFM Talkgroup Range", "AM Talkgroup", "AM Talkgroup Range",
+                "Digital Coded Squelch (DCS)", "Fleetsync Talkgroup", "Fleetsync Talkgroup Range",
+                "MDC-1200 Talkgroup", "MDC-1200 Talkgroup Range", "LoJack Transponder ESN", "User Status"),
             labels(AliasListFamily.NBFM));
     }
 

@@ -60,6 +60,7 @@ public final class ApplicationDatabaseMigrator
     private static final String ALIAS_TARGET_VERSION = "4";
     private static final String ALPHA_7_ALIAS_VERSION = "3";
     private static final String ALPHA_7_P25_VERSION = "21";
+    private static final String ALPHA_9_P25_VERSION = "24";
     private static final String P25_TARGET_VERSION = Integer.toString(P25ActivityLogSchema.SCHEMA_VERSION);
     private static final String DMR_TARGET_VERSION = Integer.toString(DmrActivitySchema.SCHEMA_VERSION);
     private static final String TRUNKED_SITE_TARGET_VERSION = Integer.toString(TrunkedSiteSchema.SCHEMA_VERSION);
@@ -195,7 +196,7 @@ public final class ApplicationDatabaseMigrator
             requireIntegrity(connection, "PRAGMA quick_check", "Quick check");
             finalizeStagedDatabase(connection);
 
-            if(sourceKind == SourceKind.ALPHA_7)
+            if(sourceKind != SourceKind.CURRENT)
             {
                 output.println(migration.releaseSummary());
             }
@@ -240,6 +241,11 @@ public final class ApplicationDatabaseMigrator
                 validateCurrentDatabase(connection);
                 requireForeignKeysValid(connection);
             }
+            else if(state.alpha9())
+            {
+                Alpha9DatabaseMigration.validateSource(connection);
+                requireForeignKeysValid(connection);
+            }
             else if(state.alpha7())
             {
                 Alpha7DatabaseMigration.validateSource(connection);
@@ -260,6 +266,11 @@ public final class ApplicationDatabaseMigrator
         if(sourceKind == SourceKind.CURRENT)
         {
             validateCurrentDatabase(connection);
+            requireForeignKeysValid(connection);
+        }
+        else if(sourceKind == SourceKind.ALPHA_9)
+        {
+            Alpha9DatabaseMigration.validateSource(connection);
             requireForeignKeysValid(connection);
         }
         else
@@ -284,7 +295,8 @@ public final class ApplicationDatabaseMigrator
                 transactionOpen = true;
 
                 String releaseSummary = sourceKind == SourceKind.ALPHA_7 ?
-                    Alpha7DatabaseMigration.migrate(connection) : "";
+                    Alpha7DatabaseMigration.migrate(connection) :
+                    sourceKind == SourceKind.ALPHA_9 ? Alpha9DatabaseMigration.migrate(connection) : "";
                 int rebased = rebasePortableDirectoryPreferences(connection, relocation);
 
                 validateCurrentDatabase(connection);
@@ -568,6 +580,12 @@ public final class ApplicationDatabaseMigrator
                 return SourceKind.CURRENT;
             }
 
+            if(ALIAS_TARGET_VERSION.equals(aliasVersion) && ALPHA_9_P25_VERSION.equals(p25Version) &&
+                TRUNKED_SITE_TARGET_VERSION.equals(trunkedSiteVersion) && DMR_TARGET_VERSION.equals(dmrVersion))
+            {
+                return SourceKind.ALPHA_9;
+            }
+
             if(ALPHA_7_ALIAS_VERSION.equals(aliasVersion) && ALPHA_7_P25_VERSION.equals(p25Version) &&
                 TRUNKED_SITE_TARGET_VERSION.equals(trunkedSiteVersion) && dmrVersion == null)
             {
@@ -575,8 +593,11 @@ public final class ApplicationDatabaseMigrator
             }
 
             throw new UnsupportedSchemaVersionException(
-                "Expected either the complete Alpha 7 source tuple (Alias v3, P25 activity v21, trunked-site v" +
-                    TRUNKED_SITE_TARGET_VERSION + ", DMR activity absent) or the complete current tuple " +
+                "Expected the complete Alpha 7 source tuple (Alias v3, P25 activity v21, trunked-site v" +
+                    TRUNKED_SITE_TARGET_VERSION + ", DMR activity absent), the complete Alpha 9 source tuple " +
+                    "(Alias v" + ALIAS_TARGET_VERSION + ", P25 activity v" + ALPHA_9_P25_VERSION +
+                    ", trunked-site v" + TRUNKED_SITE_TARGET_VERSION + ", DMR activity v" + DMR_TARGET_VERSION +
+                    "), or the complete current tuple " +
                     "(Alias v" + ALIAS_TARGET_VERSION + ", P25 activity v" + P25_TARGET_VERSION +
                     ", trunked-site v" + TRUNKED_SITE_TARGET_VERSION + ", DMR activity v" +
                     DMR_TARGET_VERSION + "). Found " + description() + ". Refusing migration.");
@@ -608,6 +629,7 @@ public final class ApplicationDatabaseMigrator
     private enum SourceKind
     {
         ALPHA_7,
+        ALPHA_9,
         CURRENT
     }
 

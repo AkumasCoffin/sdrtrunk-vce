@@ -42,13 +42,14 @@ import java.util.stream.Collectors;
  */
 public class P25ActivityLogSchema
 {
-    public static final int SCHEMA_VERSION = 24;
+    public static final int SCHEMA_VERSION = 25;
     private static final String SCHEMA_VERSION_KEY = "p25_activity_schema_version";
     public static final String CALL_OUTPUT_METRICS_STARTED_AT_KEY = "p25_call_output_metrics_started_at_ms";
     public static final String ALL_MODE_CALL_OUTPUT_METRICS_STARTED_AT_KEY =
         "all_mode_call_output_metrics_started_at_ms";
     public static final String TRUNKED_IDENTITY_METRICS_STARTED_AT_KEY =
         "trunked_identity_metrics_started_at_ms";
+    public static final String DEDUPED_CALL_METRICS_STARTED_AT_KEY = "deduped_call_metrics_started_at_ms";
     public static final int IDENTITY_ROLE_DESTINATION = 1;
     public static final int IDENTITY_ROLE_SOURCE = 2;
     public static final int IDENTITY_KIND_CHANNEL_OR_UNKNOWN = 0;
@@ -173,6 +174,8 @@ public class P25ActivityLogSchema
             Long.toString(System.currentTimeMillis()));
         SdrTrunkDatabaseStartup.setMetadata(connection, TRUNKED_IDENTITY_METRICS_STARTED_AT_KEY,
             Long.toString(System.currentTimeMillis()));
+        SdrTrunkDatabaseStartup.setMetadata(connection, DEDUPED_CALL_METRICS_STARTED_AT_KEY,
+            Long.toString(System.currentTimeMillis()));
     }
 
     public static void validate(Connection connection) throws SQLException
@@ -234,6 +237,13 @@ public class P25ActivityLogSchema
     static Long recordActivity(Connection connection, P25ActivityLogRecords.ActivityEvent activity,
                                boolean detailedEventHistoryEnabled) throws SQLException
     {
+        return recordActivity(connection, activity, detailedEventHistoryEnabled, null);
+    }
+
+    static Long recordActivity(Connection connection, P25ActivityLogRecords.ActivityEvent activity,
+                               boolean detailedEventHistoryEnabled,
+                               CrossSiteCallDeduplicator crossSiteCallDeduplicator) throws SQLException
+    {
         Long activityId = null;
         Integer systemKey = activity.contextKind() == P25ActivityLogRecords.ContextKind.TRUNKED_SITE ?
             resolveP25SystemKey(connection, activity) : null;
@@ -269,7 +279,10 @@ public class P25ActivityLogSchema
                 activityId = insertP25ActivityEvent(connection, activity, contextId);
             }
 
-            upsertTrunkedSiteMetrics(connection, activity, contextId);
+            boolean dedupedCall = activity.countedCall() && (crossSiteCallDeduplicator == null ||
+                crossSiteCallDeduplicator.isFirstObservation(scope != null ? scope.scopeToken() : activity.guid(),
+                    activity));
+            upsertTrunkedSiteMetrics(connection, activity, contextId, dedupedCall);
 
             if(systemKey != null &&
                 activityProtocol == TrunkedIdentityPolicy.PROTOCOL_P25)
@@ -1493,6 +1506,7 @@ public class P25ActivityLogSchema
                 encrypted_count INTEGER NOT NULL DEFAULT 0,
                 recorded_count INTEGER NOT NULL DEFAULT 0,
                 streamed_count INTEGER NOT NULL DEFAULT 0,
+                deduped_call_count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(context_id, bucket_start_ms)
             )
             """.formatted(ACTION_COUNT_DEFINITIONS));
@@ -1921,7 +1935,7 @@ public class P25ActivityLogSchema
         tableWithActions("p25_site_talkgroup_bucket", "context_id", "talkgroup_id", "bucket_start_ms",
             "encrypted_count", "recorded_count", "streamed_count"),
         tableWithActions("p25_site_activity_bucket", "context_id", "bucket_start_ms", "encrypted_count",
-            "recorded_count", "streamed_count"),
+            "recorded_count", "streamed_count", "deduped_call_count"),
         tableWithActionsBeforeLastEvent("conventional_activity_summary", "context_id", "frequency_hz", "timeslot",
             "first_seen_ms", "last_seen_ms", "last_event_type_code", "encrypted_count", "recorded_count",
             "streamed_count"),
@@ -2003,7 +2017,7 @@ public class P25ActivityLogSchema
 
     private static void upsertTrunkedSiteMetrics(Connection connection,
                                                  P25ActivityLogRecords.ActivityEvent activity,
-                                                 int contextId) throws SQLException
+                                                 int contextId, boolean dedupedCall) throws SQLException
     {
         Integer sourceRadio = parseInteger(activity.sourceRadioId());
         Integer target = parseInteger(activity.targetId());
@@ -2024,7 +2038,7 @@ public class P25ActivityLogSchema
             }
         }
 
-        upsertP25SiteActivityBucket(connection, activity, contextId);
+        upsertP25SiteActivityBucket(connection, activity, contextId, dedupedCall);
 
         if(activity.frequencyHertz() != null && activity.frequencyHertz() > 0)
         {
@@ -2311,15 +2325,16 @@ public class P25ActivityLogSchema
 
     private static void upsertP25SiteActivityBucket(Connection connection,
                                                     P25ActivityLogRecords.ActivityEvent activity,
-                                                    int contextId) throws SQLException
+                                                    int contextId, boolean dedupedCall) throws SQLException
     {
         try(PreparedStatement statement = connection.prepareStatement("""
             INSERT INTO p25_site_activity_bucket (
-                context_id, bucket_start_ms, %s, encrypted_count
-            ) VALUES (?, ?, %s, ?)
+                context_id, bucket_start_ms, %s, encrypted_count, deduped_call_count
+            ) VALUES (?, ?, %s, ?, ?)
             ON CONFLICT(context_id, bucket_start_ms) DO UPDATE SET
                 %s,
-                encrypted_count = p25_site_activity_bucket.encrypted_count + excluded.encrypted_count
+                encrypted_count = p25_site_activity_bucket.encrypted_count + excluded.encrypted_count,
+                deduped_call_count = p25_site_activity_bucket.deduped_call_count + excluded.deduped_call_count
             """.formatted(ACTION_INSERT_COLUMNS, ACTION_INSERT_PLACEHOLDERS,
             actionUpdateSql("p25_site_activity_bucket"))))
         {
@@ -2327,7 +2342,8 @@ public class P25ActivityLogSchema
             statement.setInt(index++, contextId);
             statement.setLong(index++, bucketStart(activity.observedAtEpochMilliseconds()));
             index = setActionCounts(statement, index, activity);
-            statement.setInt(index, activity.encrypted() ? 1 : 0);
+            statement.setInt(index++, activity.encrypted() ? 1 : 0);
+            statement.setInt(index, dedupedCall ? 1 : 0);
             statement.executeUpdate();
         }
     }

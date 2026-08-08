@@ -297,6 +297,9 @@ public class TalkgroupFormatPreference extends Preference
             case MDC1200:
                 return MDC1200TalkgroupFormatter.format(talkgroupIdentifier, getTalkgroupFormat(Protocol.MDC1200),
                     isTalkgroupFixedWidth(Protocol.MDC1200));
+            case AM:
+                return AnalogTalkgroupFormatter.format(talkgroupIdentifier, getTalkgroupFormat(Protocol.AM),
+                        isTalkgroupFixedWidth(Protocol.AM));
             case NBFM:
                 return AnalogTalkgroupFormatter.format(talkgroupIdentifier, getTalkgroupFormat(Protocol.NBFM),
                         isTalkgroupFixedWidth(Protocol.NBFM));

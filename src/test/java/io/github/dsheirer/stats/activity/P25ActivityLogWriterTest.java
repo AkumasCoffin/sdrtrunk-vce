@@ -794,7 +794,7 @@ class P25ActivityLogWriterTest
                 "SELECT value FROM database_metadata WHERE key='p25_activity_schema_version'"))
             {
                 assertTrue(resultSet.next());
-                assertEquals("24", resultSet.getString(1));
+                assertEquals("25", resultSet.getString(1));
             }
 
             try(ResultSet resultSet = statement.executeQuery("""
