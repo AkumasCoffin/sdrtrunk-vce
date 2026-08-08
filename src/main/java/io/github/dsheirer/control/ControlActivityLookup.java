@@ -170,11 +170,24 @@ public class ControlActivityLookup
 
         int clamped = Math.max(1, Math.min(500, limit));
 
-        String sql = "SELECT id, observed_at_ms, action, event_type, source_radio_id, target_id, frequency_hz, " +
-                "timeslot, encrypted, resolved_rfss, resolved_site, resolved_nac, resolved_wacn, " +
-                "resolved_system_id, resolved_channel_name FROM p25_activity_event_resolved WHERE id > ?" +
-                (callsOnly ? " AND event_type_code IN (" + CALL_EVENT_TYPE_CODES + ")" : "") +
-                " ORDER BY id ASC LIMIT " + clamped;
+        //systemName: the channel's configured system name (e.g. "NSWPSN") the operator sees, joined from the
+        //event's receiver context guid to configuration_channel.radres_guid.  sourceAlias: the over-the-air talker
+        //alias last captured for the source radio, joined via trunked_identity_scope_context (context -> scope) to
+        //the per-radio identity summary (identity_kind_code 2 = RADIO, see TrunkedIdentityPolicy.IDENTITY_KIND_RADIO).
+        //Both are correlated scalar subqueries so each event yields exactly one row and an unresolvable join is null.
+        String sql = "SELECT v.id, v.observed_at_ms, v.action, v.event_type, v.source_radio_id, v.target_id, " +
+                "v.frequency_hz, v.timeslot, v.encrypted, v.resolved_rfss, v.resolved_site, v.resolved_nac, " +
+                "v.resolved_wacn, v.resolved_system_id, v.resolved_channel_name, " +
+                "(SELECT cc.system_name FROM configuration_channel cc WHERE cc.radres_guid = v.guid LIMIT 1) " +
+                "AS system_name, " +
+                "(SELECT tis.last_talker_alias FROM trunked_identity_scope_context tsc " +
+                "JOIN trunked_identity_summary tis ON tis.scope_id = tsc.scope_id AND tis.identity_kind_code = 2 " +
+                "AND tis.identity_id = v.source_radio_id " +
+                "WHERE tsc.context_id = v.context_id AND tis.last_talker_alias IS NOT NULL " +
+                "ORDER BY tis.last_talker_alias_seen_ms DESC LIMIT 1) AS source_alias " +
+                "FROM p25_activity_event_resolved v WHERE v.id > ?" +
+                (callsOnly ? " AND v.event_type_code IN (" + CALL_EVENT_TYPE_CODES + ")" : "") +
+                " ORDER BY v.id ASC LIMIT " + clamped;
 
         try(Connection connection = openReadOnly();
             PreparedStatement statement = connection.prepareStatement(sql))
@@ -205,6 +218,8 @@ public class ControlActivityLookup
                     event.put("wacn", results.getObject(13));
                     event.put("systemId", results.getObject(14));
                     event.put("channelName", results.getObject(15));
+                    event.put("systemName", results.getObject(16));
+                    event.put("sourceAlias", results.getObject(17));
                     events.add(event);
                 }
             }
