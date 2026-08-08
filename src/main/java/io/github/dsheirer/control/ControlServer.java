@@ -99,6 +99,7 @@ public class ControlServer
     private final String mToken;
     private final Path mDatabasePath;
     private final ControlActivityLookup mActivityLookup;
+    private final ControlSiteLookup mSiteLookup;
     private final ObjectMapper mMapper = new ObjectMapper();
 
     private HttpServer mHttpServer;
@@ -141,6 +142,7 @@ public class ControlServer
         mToken = token;
         mDatabasePath = SdrTrunkDatabasePath.getDatabasePath(userPreferences);
         mActivityLookup = new ControlActivityLookup(mDatabasePath);
+        mSiteLookup = new ControlSiteLookup(mDatabasePath);
     }
 
     /**
@@ -186,6 +188,7 @@ public class ControlServer
         mHttpServer.createContext("/playlist", this::handleConfig);
         mHttpServer.createContext("/config", this::handleConfig);
         mHttpServer.createContext("/activity", this::handleActivity);
+        mHttpServer.createContext("/site", this::handleSite);
         mHttpServer.start();
 
         mWsServer = new ControlWebSocketServer(new InetSocketAddress(InetAddress.getLoopbackAddress(), mPort + 1),
@@ -1983,6 +1986,40 @@ public class ControlServer
                 }
 
                 sendJson(exchange, 200, mActivityLookup.recentEvents(sinceId, limit, !kinds.equals("all")));
+                return;
+            }
+
+            sendJson(exchange, 404, error("not found"));
+        }
+        catch(Exception e)
+        {
+            sendError(exchange, e);
+        }
+        finally
+        {
+            exchange.close();
+        }
+    }
+
+    /**
+     * Read-only deep P25 site metadata for the node agent's site-view feed.  {@code GET /site/snapshots} returns
+     * {@code {"sites":[ <site> ]}} - see {@link ControlSiteLookup} for the per-site ingest contract.  A busy/locked/
+     * missing database yields an empty {@code sites} array rather than an error.
+     */
+    private void handleSite(HttpExchange exchange)
+    {
+        try
+        {
+            if(!authorize(exchange))
+            {
+                return;
+            }
+
+            String path = exchange.getRequestURI().getPath();
+
+            if(path.equals("/site/snapshots"))
+            {
+                sendJson(exchange, 200, mSiteLookup.siteSnapshots());
                 return;
             }
 
