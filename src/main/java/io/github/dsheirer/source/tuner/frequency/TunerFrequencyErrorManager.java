@@ -254,6 +254,58 @@ public class TunerFrequencyErrorManager implements ISourceEventProcessor
         return mTunerCorrection;
     }
 
+    /**
+     * Representative persistent measured frequency error for this tuner, in PPM, as determined by the frequency-
+     * correction loops.  Intended for status reporting (e.g. the control server's {@code /tuners} measuredPpmError).
+     *
+     * <p>Unlike {@link TunerController#getPPMFrequencyError()} - a per-tick tuner average that
+     * {@link #processTunerCorrection} resets to zero on any 5-second tick with no reporting channel, and which,
+     * once Auto-PPM converges, sits at ~0 because the measured offset has already been moved into the tuner's PPM
+     * correction - this reflects the correction the loops are actually holding, and so remains non-zero for a tuner
+     * whose front end is genuinely off frequency:</p>
+     * <ul>
+     *   <li>the Auto-PPM delta this manager has dialed away from the operator's baseline PPM (dominant, and the
+     *       whole story, when Auto-PPM is enabled), and</li>
+     *   <li>the largest residual per-channel AFC correction still applied by a locked channel (which owns the whole
+     *       measured error when Auto-PPM is disabled but the per-channel AFC still runs).</li>
+     * </ul>
+     *
+     * <p>The larger-magnitude of the two is returned with its sign preserved.  Returns 0.0 when the tuner frequency
+     * is unknown or no channel is currently correcting (nothing measured).</p>
+     */
+    public double getMeasuredPPMError()
+    {
+        long frequency = mTunerController.getFrequency();
+
+        if(frequency <= 0)
+        {
+            return 0.0d;
+        }
+
+        double frequencyMHz = frequency / 1_000_000.0d;
+
+        //Auto-PPM: how far this manager has moved the tuner PPM away from the operator baseline (0 when disabled or
+        //not yet moved). This is the measured offset Auto-PPM has already absorbed into the tuner correction.
+        double baselineDeltaPPM = mTunerController.getFrequencyCorrection() - mAutoCorrectionBaselinePPM;
+
+        //Per-channel AFC: the largest residual correction a locked channel is still applying (sign preserved).
+        long maxChannelErrorHz = 0;
+
+        for(ChannelFrequencyErrorManager manager: getChannelManagersSnapshot())
+        {
+            long error = manager.getFrequencyError();
+
+            if(Math.abs(error) > Math.abs(maxChannelErrorHz))
+            {
+                maxChannelErrorHz = error;
+            }
+        }
+
+        double channelPPM = maxChannelErrorHz / frequencyMHz;
+
+        return Math.abs(baselineDeltaPPM) >= Math.abs(channelPPM) ? baselineDeltaPPM : channelPPM;
+    }
+
     public void add(ChannelFrequencyErrorManager channelFrequencyErrorManager)
     {
         boolean startRequired = false;

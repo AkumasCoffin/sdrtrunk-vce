@@ -36,6 +36,7 @@ import io.github.dsheirer.controller.channel.ChannelProcessingManager;
 import io.github.dsheirer.database.SdrTrunkDatabasePath;
 import io.github.dsheirer.database.configuration.ConfigurationSnapshotDatabaseStore;
 import io.github.dsheirer.identifier.Identifier;
+import io.github.dsheirer.module.decode.DecoderType;
 import io.github.dsheirer.source.SourceException;
 import io.github.dsheirer.source.tuner.Tuner;
 import io.github.dsheirer.source.tuner.TunerController;
@@ -72,9 +73,13 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -107,6 +112,38 @@ public class ControlServer
     private ExecutorService mExecutor;
     private EventBuffer mEventBuffer;
     private long mStartTime;
+
+    //---------------------------------------------------------------------------------------------------------------
+    // Self-healing auto-start (headless only): a periodic guarded pass that (re)starts auto-start channels that are
+    // not processing, and force-restarts a trunking channel that has been PROCESSING but never locked (IDLE) past a
+    // threshold. Conservative + rate-limited so it never churns a channel that is merely quiet.
+    //---------------------------------------------------------------------------------------------------------------
+
+    /** Interval between self-heal passes. */
+    private static final long SELF_HEAL_INTERVAL_SECONDS = 30;
+
+    /** A trunking channel PROCESSING but never locked (never CONTROL/CALL) for at least this long is restarted once. */
+    private static final long IDLE_RESTART_THRESHOLD_MS = 90_000L;
+
+    /** Minimum time between forced restarts of the SAME channel, so a persistently-unlucky channel isn't churned. */
+    private static final long IDLE_RESTART_COOLDOWN_MS = 300_000L;
+
+    /**
+     * Trunking decoders whose healthy resting state is CONTROL (locked on the control channel).  The IDLE force-
+     * restart heuristic applies ONLY to these - a conventional channel (NBFM/AM) sits IDLE at rest with no traffic,
+     * which is normal and must never trigger a restart.
+     */
+    private static final Set<DecoderType> CONTROL_LOCKING_DECODERS =
+            java.util.EnumSet.of(DecoderType.P25_PHASE1, DecoderType.P25_PHASE2, DecoderType.DMR);
+
+    private ScheduledExecutorService mSelfHealExecutor;
+    private ScheduledFuture<?> mSelfHealFuture;
+
+    /** channelId -&gt; epoch ms first observed PROCESSING-but-not-locked in the current unlocked streak (else absent). */
+    private final Map<Integer,Long> mChannelUnlockedSince = new ConcurrentHashMap<>();
+
+    /** channelId -&gt; epoch ms of the last forced restart, for cooldown rate-limiting. */
+    private final Map<Integer,Long> mChannelLastRestart = new ConcurrentHashMap<>();
 
     /**
      * Last gain value applied to each tuner via this control API, keyed by tuner id.  Most SDR-Trunk tuner
@@ -195,6 +232,21 @@ public class ControlServer
                 this, mToken);
         mWsServer.start();
 
+        //Headless self-healing auto-start timer. It self-skips while the decode-readiness gate is closed (first-run
+        //calibration/JMBE) and while not headless, so it is safe to arm here even though it starts before first-run
+        //setup completes.
+        if(mHeadless)
+        {
+            mSelfHealExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "sdrtrunk-control-selfheal");
+                t.setDaemon(true);
+                return t;
+            });
+            mSelfHealFuture = mSelfHealExecutor.scheduleWithFixedDelay(this::selfHealChannels,
+                    SELF_HEAL_INTERVAL_SECONDS, SELF_HEAL_INTERVAL_SECONDS, TimeUnit.SECONDS);
+            mLog.info("Control server self-healing auto-start armed (every " + SELF_HEAL_INTERVAL_SECONDS + "s)");
+        }
+
         mLog.info("Control server started - REST on 127.0.0.1:" + mPort + ", spectrum WS on 127.0.0.1:" + (mPort + 1));
     }
 
@@ -204,6 +256,18 @@ public class ControlServer
     public void stop()
     {
         mLog.info("Stopping control server ...");
+
+        if(mSelfHealFuture != null)
+        {
+            mSelfHealFuture.cancel(true);
+            mSelfHealFuture = null;
+        }
+
+        if(mSelfHealExecutor != null)
+        {
+            mSelfHealExecutor.shutdownNow();
+            mSelfHealExecutor = null;
+        }
 
         if(mWsServer != null)
         {
@@ -379,7 +443,20 @@ public class ControlServer
                 entry.put("frequency", c.getFrequency());
                 entry.put("sampleRate", c.getSampleRate());
                 entry.put("ppm", c.getFrequencyCorrection());
-                entry.put("measuredPpmError", c.getPPMFrequencyError());
+
+                //Measured frequency error (ppm). c.getPPMFrequencyError() is a transient tuner-tick average that
+                //resets to 0 between ticks and, once Auto-PPM converges, sits at ~0 (the offset has been absorbed
+                //into the ppm above), so it almost always reads 0.00 in a REST snapshot. Prefer the persistent value
+                //the correction loops are actually holding (Auto-PPM baseline delta, else the largest locked-channel
+                //AFC residual); fall back to the legacy transient value if the loop hasn't produced one yet.
+                double measuredPpmError = c.getTunerFrequencyErrorManager().getMeasuredPPMError();
+
+                if(measuredPpmError == 0.0d)
+                {
+                    measuredPpmError = c.getPPMFrequencyError();
+                }
+
+                entry.put("measuredPpmError", measuredPpmError);
 
                 //Current gain: real value where the controller can read it, else the last value set via this API.
                 Object realGain = readCurrentGain(c);
@@ -1907,6 +1984,193 @@ public class ControlServer
         }
 
         return true;
+    }
+
+    /**
+     * Periodic self-healing pass for headless nodes (armed from {@link #start()} on a ~30s scheduler).  Channels
+     * sometimes fail to come up or come up but never lock; this makes auto-start self-healing without any operator
+     * action.  Two conservative, clearly-logged actions, both gated on the headless decode-readiness gate so nothing
+     * fights first-run calibration/JMBE:
+     *
+     * <ol>
+     *   <li><b>Restart of a not-processing auto-start channel.</b> Any {@code getAutoStartChannels()} entry that is
+     *       currently not processing (never started, or died) is (re)started with the same per-channel guarded start
+     *       used by {@link #startAutoStartChannels()} - a per-channel failure is logged and does not abort the pass.</li>
+     *   <li><b>Force-restart of a stuck-IDLE trunking channel.</b> A P25/DMR channel that has been PROCESSING but has
+     *       never reached CONTROL/CALL for longer than {@link #IDLE_RESTART_THRESHOLD_MS} is stopped and restarted
+     *       once to force re-acquisition, rate-limited by {@link #IDLE_RESTART_COOLDOWN_MS} per channel.  Conventional
+     *       (NBFM/AM) channels are deliberately excluded - IDLE is their normal resting state with no traffic.</li>
+     * </ol>
+     */
+    private void selfHealChannels()
+    {
+        try
+        {
+            //Only headless nodes self-heal, and never while first-run calibration/JMBE gate is closed.
+            if(!mHeadless)
+            {
+                return;
+            }
+
+            if(mDecodeReadyGate != null && !mDecodeReadyGate.getAsBoolean())
+            {
+                return;
+            }
+
+            ChannelProcessingManager cpm = mConfigurationManager.getChannelProcessingManager();
+            Map<Channel,String> stateByChannel = buildChannelStateLookup(cpm.getChannelMetadataModel());
+            long now = System.currentTimeMillis();
+
+            for(Channel channel : mConfigurationManager.getChannelModel().getAutoStartChannels())
+            {
+                int id = channel.getChannelID();
+
+                //(a) Not processing - failed or never started. (Re)start it.
+                if(!channel.isProcessing())
+                {
+                    mChannelUnlockedSince.remove(id);
+
+                    try
+                    {
+                        cpm.start(channel);
+                        mLog.info("self-heal: started auto-start channel [" + channel.getName() +
+                                "] that was not processing");
+                    }
+                    catch(ChannelException | RuntimeException e)
+                    {
+                        mLog.warn("self-heal: start failed for channel [" + channel.getName() + "] - " + e.getMessage());
+                    }
+
+                    continue;
+                }
+
+                //(b) Processing - check whether a trunking channel is stuck unlocked (never reached CONTROL/CALL).
+                if(!isControlLockingChannel(channel))
+                {
+                    mChannelUnlockedSince.remove(id);
+                    continue;
+                }
+
+                String state = stateByChannel.get(channel);
+
+                if(isLockedState(state))
+                {
+                    //Healthy - clear any unlocked streak.
+                    mChannelUnlockedSince.remove(id);
+                    continue;
+                }
+
+                long since = mChannelUnlockedSince.computeIfAbsent(id, k -> now);
+                long unlockedMs = now - since;
+                long lastRestart = mChannelLastRestart.getOrDefault(id, 0L);
+
+                if(unlockedMs >= IDLE_RESTART_THRESHOLD_MS && (now - lastRestart) >= IDLE_RESTART_COOLDOWN_MS)
+                {
+                    mLog.info("self-heal: trunking channel [" + channel.getName() + "] processing but not locked (state=" +
+                            (state != null ? state : "PROCESSING") + ") for " + (unlockedMs / 1000) +
+                            "s - restarting to force re-acquisition");
+
+                    try
+                    {
+                        cpm.stop(channel);
+                        cpm.start(channel);
+                    }
+                    catch(ChannelException | RuntimeException e)
+                    {
+                        mLog.warn("self-heal: restart failed for channel [" + channel.getName() + "] - " + e.getMessage());
+                    }
+
+                    mChannelLastRestart.put(id, now);
+                    mChannelUnlockedSince.remove(id); //reset the streak; give the restart time to lock
+                }
+            }
+        }
+        catch(Throwable t)
+        {
+            //Never let a self-heal pass throw out of the scheduler.
+            mLog.warn("self-heal: pass error", t);
+        }
+    }
+
+    /**
+     * Builds a channel -&gt; state-text lookup from the live channel metadata model, mirroring the snapshot logic in
+     * {@link #buildChannelList()}.  State text is the channel-state identifier (e.g. CONTROL, CALL, IDLE); channels
+     * with no metadata row are simply absent from the map.
+     */
+    private Map<Channel,String> buildChannelStateLookup(ChannelMetadataModel mm)
+    {
+        Map<Channel,String> stateByChannel = new HashMap<>();
+        int rows = mm.getRowCount();
+
+        for(int r = 0; r < rows; r++)
+        {
+            try
+            {
+                ChannelMetadata meta = mm.getChannelMetadata(r);
+
+                if(meta != null)
+                {
+                    Channel ch = mm.getChannelFromMetadata(meta);
+
+                    if(ch != null)
+                    {
+                        Identifier state = meta.getChannelStateIdentifier();
+                        stateByChannel.putIfAbsent(ch, state != null ? state.toString() : null);
+                    }
+                }
+            }
+            catch(Exception e)
+            {
+                //Metadata list mutates on the EDT - ignore transient index issues.
+            }
+        }
+
+        return stateByChannel;
+    }
+
+    /**
+     * Whether the channel's decoder is a trunking type whose healthy resting state is CONTROL, so a prolonged
+     * unlocked (IDLE) state is a fault rather than the normal no-traffic resting state of a conventional channel.
+     */
+    private boolean isControlLockingChannel(Channel channel)
+    {
+        try
+        {
+            if(channel.getDecodeConfiguration() != null)
+            {
+                return CONTROL_LOCKING_DECODERS.contains(channel.getDecodeConfiguration().getDecoderType());
+            }
+        }
+        catch(Exception e)
+        {
+            //best effort - treat as non-trunking (never force-restart) on any doubt
+        }
+
+        return false;
+    }
+
+    /**
+     * Whether the given channel-state text represents an active/locked decode (CONTROL lock or a live call) rather
+     * than an unlocked/idle state.  Null/blank and IDLE/FADE/RESET/TEARDOWN are considered not-locked.
+     */
+    private static boolean isLockedState(String stateText)
+    {
+        if(stateText == null)
+        {
+            return false;
+        }
+
+        switch(stateText)
+        {
+            case "CONTROL":
+            case "CALL":
+            case "ENCRYPTED":
+            case "DATA":
+            case "ACTIVE":
+                return true;
+            default:
+                return false;
+        }
     }
 
     //---------------------------------------------------------------------------------------------------------------
