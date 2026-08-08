@@ -385,8 +385,9 @@ public class ControlServer
                 Object realGain = readCurrentGain(c);
                 entry.put("gain", realGain != null ? realGain : mLastGain.get(dt.getId()));
 
-                //Auto-PPM (automatic frequency error correction) is not available in this build.
-                entry.put("autoPpm", false);
+                //Auto-PPM: the tuner's automatic frequency-error correction manager, fed by the
+                //decoders' measured error. Report its real enabled state (defaults on).
+                entry.put("autoPpm", c.getTunerFrequencyErrorManager().isEnabled());
 
                 //Per-device capabilities so the UI can build correct controls without hardcoding per-type.
                 entry.put("capabilities", buildTunerCapabilities(c));
@@ -761,12 +762,14 @@ public class ControlServer
             }
             case "autoppm":
             {
-                //This build has no automatic frequency error correction manager - report as a no-op.
+                //Enable/disable the tuner's automatic frequency-error (PPM) correction manager.
+                //Runtime-only: the node agent persists the setting (config_override.tuners[]) and
+                //re-applies it on boot, so no config write is needed here.
                 boolean enabled = body.has("enabled") && body.get("enabled").asBoolean();
+                c.getTunerFrequencyErrorManager().setEnabled(enabled);
                 Map<String,Object> ok = new LinkedHashMap<>();
                 ok.put("ok", true);
-                ok.put("autoPpm", enabled);
-                ok.put("note", "not supported by this build");
+                ok.put("autoPpm", c.getTunerFrequencyErrorManager().isEnabled());
                 sendJson(exchange, 200, ok);
                 break;
             }
