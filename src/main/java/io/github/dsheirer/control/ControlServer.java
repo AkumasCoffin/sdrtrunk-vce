@@ -1757,6 +1757,14 @@ public class ControlServer
                         //import - every alias would arrive matcher-less and the snapshot store rejects it ("must
                         //have exactly one match identifier"). Recover them from the raw tree onto the parsed aliases.
                         applyIgnoredAliasFields(state.getAliases(), root, lenient);
+                        //Channel.autoStart does NOT round-trip through JSON: getAutoStart() carries only the XML
+                        //annotation (localName="enabled"), isAutoStart() is @JsonIgnore and setAutoStart() only has
+                        //@JsonAlias("enabled"), so Jackson marks the whole property ignored and DROPS the node's
+                        //"autoStart": true on import. It then persists as auto_start=0 and on EVERY restart the
+                        //channel reloads with isAutoStart()==false -> getAutoStartChannels() is empty -> nothing
+                        //auto-starts (manual start ignores the flag, which is why that always works). Recover the
+                        //flag from the raw tree onto each parsed Channel before persisting, mirroring the alias fix.
+                        applyIgnoredChannelFields(state.getChannels(), root);
                     }
                 }
                 catch(Exception e)
@@ -1954,6 +1962,50 @@ public class ControlServer
     }
 
     /**
+     * Recovers the {@code autoStart} flag (and {@code autoStartOrder}) from the raw import JSON onto each parsed
+     * {@link io.github.dsheirer.controller.channel.Channel}.  Jackson drops {@code autoStart} on deserialization
+     * because the property is split across a {@code @JsonIgnore} {@code isAutoStart()} getter and inert XML-only
+     * annotations on {@code getAutoStart()}/{@code setAutoStart()} - see the call site.  Without this, every imported
+     * channel is persisted with {@code auto_start=0} and never auto-starts on restart.  Index-aligned with the parsed
+     * channel list exactly like {@link #applyIgnoredAliasFields}.  Accepts both the node's {@code "autoStart"} and the
+     * legacy XML {@code "enabled"} spelling.
+     */
+    private static void applyIgnoredChannelFields(List<io.github.dsheirer.controller.channel.Channel> channels,
+                                                  JsonNode root)
+    {
+        if(channels == null || root == null || !root.has("channels") || !root.get("channels").isArray())
+        {
+            return;
+        }
+
+        JsonNode arr = root.get("channels");
+
+        for(int i = 0; i < channels.size() && i < arr.size(); i++)
+        {
+            io.github.dsheirer.controller.channel.Channel channel = channels.get(i);
+            JsonNode node = arr.get(i);
+
+            if(channel == null || node == null)
+            {
+                continue;
+            }
+
+            JsonNode autoStart = node.has("autoStart") ? node.get("autoStart") : node.get("enabled");
+            if(autoStart != null && autoStart.isBoolean())
+            {
+                channel.setAutoStart(autoStart.asBoolean());
+            }
+
+            //autoStartOrder already round-trips via its @JsonAlias("order"), but recover it defensively too.
+            JsonNode order = node.has("autoStartOrder") ? node.get("autoStartOrder") : node.get("order");
+            if(order != null && order.isNumber())
+            {
+                channel.setAutoStartOrder(order.asInt());
+            }
+        }
+    }
+
+    /**
      * Starts all auto-start channels unless the headless decode-readiness gate (CPU calibration + JMBE codec)
      * blocks it.  Per-channel start failures are logged and do not abort the remaining channels.
      *
@@ -2064,24 +2116,19 @@ public class ControlServer
                 long unlockedMs = now - since;
                 long lastRestart = mChannelLastRestart.getOrDefault(id, 0L);
 
+                //A trunking channel PROCESSING but not locked is now LEFT ALONE. Force-restarting it here churned
+                //every sibling channel packed onto the same SDR: cpm.start() recenters the shared dongle, which
+                //re-derives each sibling's DDC output processor and knocks locked control channels to IDLE for ~5s
+                //- and a sibling that then crossed this same threshold got restarted in turn, a self-perpetuating
+                //churn loop across the dongle. Stock sdrtrunk has no such heuristic and locks reliably. So we only
+                //SURFACE the stuck channel (rate-limited) and let it re-acquire on its own; a genuinely wedged
+                //channel is fixed by a manual restart or by spreading channels across SDRs, without churning peers.
                 if(unlockedMs >= IDLE_RESTART_THRESHOLD_MS && (now - lastRestart) >= IDLE_RESTART_COOLDOWN_MS)
                 {
-                    mLog.info("self-heal: trunking channel [" + channel.getName() + "] processing but not locked (state=" +
+                    mLog.warn("self-heal: trunking channel [" + channel.getName() + "] processing but not locked (state=" +
                             (state != null ? state : "PROCESSING") + ") for " + (unlockedMs / 1000) +
-                            "s - restarting to force re-acquisition");
-
-                    try
-                    {
-                        cpm.stop(channel);
-                        cpm.start(channel);
-                    }
-                    catch(ChannelException | RuntimeException e)
-                    {
-                        mLog.warn("self-heal: restart failed for channel [" + channel.getName() + "] - " + e.getMessage());
-                    }
-
-                    mChannelLastRestart.put(id, now);
-                    mChannelUnlockedSince.remove(id); //reset the streak; give the restart time to lock
+                            "s - leaving it (force-restart disabled: restarting churns sibling channels on the same SDR)");
+                    mChannelLastRestart.put(id, now); //rate-limit this notice (no restart performed)
                 }
             }
         }
