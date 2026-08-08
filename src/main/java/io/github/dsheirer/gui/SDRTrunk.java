@@ -342,6 +342,18 @@ public class SDRTrunk implements Listener<TunerEvent>
             {
                 maybeRestartAfterFirstRunSetup();
             }
+
+            //Calibration + JMBE are now satisfied. The control server came up BEFORE
+            //this setup ran, so the node agent's /config/import almost certainly landed
+            //while decode-readiness was still false — its auto-start channels were gated
+            //off (see ControlServer.startAutoStartChannels) and nothing else re-triggers
+            //them. Start them now so a fresh node's channels come up without needing a
+            //manual reload. No-op when there are no auto-start channels or they're
+            //already running (per-channel start is guarded).
+            if(mControlServer != null)
+            {
+                mControlServer.startAutoStartChannels();
+            }
         }
         else
         {

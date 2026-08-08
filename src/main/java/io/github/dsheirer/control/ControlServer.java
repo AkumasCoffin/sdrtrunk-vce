@@ -1879,7 +1879,7 @@ public class ControlServer
      *
      * @return true when channel starting was attempted, false when the decode gate blocked it (decode pending).
      */
-    private boolean startAutoStartChannels()
+    public boolean startAutoStartChannels()
     {
         if(mHeadless && mDecodeReadyGate != null && !mDecodeReadyGate.getAsBoolean())
         {
