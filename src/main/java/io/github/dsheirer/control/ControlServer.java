@@ -1663,11 +1663,17 @@ public class ControlServer
 
                     if(state != null)
                     {
+                        JsonNode root = lenient.readTree(bytes);
                         //ConfigurationState marks aliasListDefinitions @JsonIgnore (and AliasListDefinition has no
                         //default constructor), so Jackson drops the property - recover it from the raw tree and
                         //install via the setter.  Channels/aliases reference these list names, and the snapshot
                         //replace persists them, so losing them would fail validation on reload.
-                        state.setAliasListDefinitions(parseAliasListDefinitions(lenient.readTree(bytes)));
+                        state.setAliasListDefinitions(parseAliasListDefinitions(root));
+                        //Alias persists its matcher, stream-as-talkgroup, broadcast routes, priority and recordable
+                        //flag in dedicated DB columns, so those getters are @JsonIgnore and Jackson drops them on
+                        //import - every alias would arrive matcher-less and the snapshot store rejects it ("must
+                        //have exactly one match identifier"). Recover them from the raw tree onto the parsed aliases.
+                        applyIgnoredAliasFields(state.getAliases(), root, lenient);
                     }
                 }
                 catch(Exception e)
@@ -1688,6 +1694,17 @@ public class ControlServer
                 if(state.getAliases() == null)
                 {
                     state.setAliases(new ArrayList<>());
+                }
+
+                //Belt-and-braces: an alias that still has no match identifier after recovery can never match and
+                //would fail the snapshot store's "exactly one match identifier" check, aborting the ENTIRE import.
+                //Drop those individually instead so one bad alias can't block the whole config.
+                int beforeAliases = state.getAliases().size();
+                state.getAliases().removeIf(a -> a == null || a.getMatchIdentifier() == null);
+                int droppedAliases = beforeAliases - state.getAliases().size();
+                if(droppedAliases > 0)
+                {
+                    mLog.warn("config import: dropped " + droppedAliases + " alias(es) with no match identifier");
                 }
 
                 if(state.getAliasListDefinitions() == null)
@@ -1781,6 +1798,76 @@ public class ControlServer
         }
 
         return definitions;
+    }
+
+    /**
+     * Recovers the alias fields that {@link io.github.dsheirer.alias.Alias} keeps out of its JSON form (they are
+     * {@code @JsonIgnore} because vce persists them in dedicated alias-table columns): the single match identifier,
+     * the stream-as-talkgroup override, broadcast routes, call priority and the recordable flag.  These are read from
+     * the raw {@code aliases[]} nodes (index-aligned with the Jackson-parsed alias list, whose order Jackson
+     * preserves) and installed via the setters, exactly as the DB loader does.  Sub-objects are converted with the
+     * lenient mapper so the {@code AliasID}/{@code StreamAsTalkgroup}/{@code BroadcastChannel} polymorphic
+     * {@code @JsonTypeInfo} discriminators resolve.
+     */
+    private static void applyIgnoredAliasFields(List<io.github.dsheirer.alias.Alias> aliases, JsonNode root,
+                                                ObjectMapper mapper) throws IOException
+    {
+        if(aliases == null || root == null || !root.has("aliases") || !root.get("aliases").isArray())
+        {
+            return;
+        }
+
+        JsonNode arr = root.get("aliases");
+
+        for(int i = 0; i < aliases.size() && i < arr.size(); i++)
+        {
+            io.github.dsheirer.alias.Alias alias = aliases.get(i);
+            JsonNode node = arr.get(i);
+
+            if(alias == null || node == null)
+            {
+                continue;
+            }
+
+            JsonNode matcher = node.get("matchIdentifier");
+            if(matcher != null && !matcher.isNull())
+            {
+                alias.setMatchIdentifier(mapper.treeToValue(matcher, io.github.dsheirer.alias.id.AliasID.class));
+            }
+
+            JsonNode stream = node.get("streamTalkgroupAlias");
+            if(stream != null && !stream.isNull())
+            {
+                alias.setStreamTalkgroupAlias(mapper.treeToValue(stream,
+                        io.github.dsheirer.alias.id.talkgroup.StreamAsTalkgroup.class));
+            }
+
+            JsonNode broadcasts = node.get("broadcastChannels");
+            if(broadcasts != null && broadcasts.isArray())
+            {
+                for(JsonNode bc : broadcasts)
+                {
+                    io.github.dsheirer.alias.id.broadcast.BroadcastChannel channel =
+                            mapper.treeToValue(bc, io.github.dsheirer.alias.id.broadcast.BroadcastChannel.class);
+                    if(channel != null && channel.getChannelName() != null && !channel.getChannelName().isBlank())
+                    {
+                        alias.addBroadcastChannel(channel);
+                    }
+                }
+            }
+
+            JsonNode priority = node.get("callPriority");
+            if(priority != null && priority.isNumber())
+            {
+                alias.setCallPriority(priority.asInt());
+            }
+
+            JsonNode recordable = node.get("recordable");
+            if(recordable != null && recordable.isBoolean())
+            {
+                alias.setRecordable(recordable.asBoolean());
+            }
+        }
     }
 
     /**

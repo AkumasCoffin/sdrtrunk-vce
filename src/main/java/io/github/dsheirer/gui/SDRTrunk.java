@@ -583,9 +583,14 @@ public class SDRTrunk implements Listener<TunerEvent>
     }
 
     /**
-     * True only when BOTH the CPU calibration and the JMBE voice codec are ready.
-     * Headless channels must not decode until this holds (no JMBE -> calls with no
-     * audio).  The gate only applies headless - GUI builds always return true.
+     * Whether headless channels may auto-start. Gated ONLY on CPU calibration:
+     * it runs during first-run setup and a mid-calibration start would fight it
+     * for the CPU (the one restart afterwards clears this). JMBE is deliberately
+     * NOT a gate — it is only needed for voice AUDIO, whereas control-channel
+     * decoding (which produces all the call/site/talkgroup/radio activity the
+     * data pipeline consumes) needs no codec. A failed JMBE install must not
+     * leave a node silent on metadata; it just means no audio until JMBE lands.
+     * The gate only applies headless - GUI builds always return true.
      */
     private boolean isReadyToDecodeHeadless()
     {
@@ -594,14 +599,17 @@ public class SDRTrunk implements Listener<TunerEvent>
             return true;
         }
 
-        boolean calibrated = CalibrationManager.getInstance().isCalibrated();
-        Path jmbe = mUserPreferences.getJmbeLibraryPreference().getPathJmbeLibrary();
-        boolean jmbeOk = jmbe != null && Files.exists(jmbe);
-        if(!calibrated || !jmbeOk)
+        if(!CalibrationManager.getInstance().isCalibrated())
         {
-            mLog.error("headless: NOT auto-starting channels — calibrated=" + calibrated + " jmbeInstalled=" + jmbeOk +
-                    ". Decoding without the JMBE codec produces no voice audio; channels will start once both are ready.");
+            mLog.info("headless: deferring channel auto-start until CPU calibration completes");
             return false;
+        }
+
+        Path jmbe = mUserPreferences.getJmbeLibraryPreference().getPathJmbeLibrary();
+        if(jmbe == null || !Files.exists(jmbe))
+        {
+            mLog.warn("headless: starting channels WITHOUT the JMBE codec — control-channel decoding and activity " +
+                    "logging work, but decoded voice calls will have no audio until JMBE is installed");
         }
         return true;
     }
