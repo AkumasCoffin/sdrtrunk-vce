@@ -29,7 +29,9 @@ import io.github.dsheirer.channel.metadata.ChannelMetadata;
 import io.github.dsheirer.channel.metadata.ChannelMetadataModel;
 import io.github.dsheirer.configuration.ConfigurationManager;
 import io.github.dsheirer.configuration.ConfigurationState;
+import io.github.dsheirer.channel.quality.ControlChannelQualitySnapshot;
 import io.github.dsheirer.controller.channel.Channel;
+import io.github.dsheirer.sample.Listener;
 import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelModel;
 import io.github.dsheirer.controller.channel.ChannelProcessingManager;
@@ -154,6 +156,27 @@ public class ControlServer
     private final Map<String,Object> mLastGain = new ConcurrentHashMap<>();
 
     /**
+     * Latest control-channel quality snapshot per configured channel, keyed by the Channel object the
+     * {@link ControlChannelQualityMonitor} was attached to.  Fed by {@link #mQualityListener} (registered on the
+     * ChannelProcessingManager in {@link #start()}); read by buildChannelList / buildActiveCalls to emit each
+     * channel's live decode-health % ({@code syncPercent}) and signal level ({@code signalDbfs}).  Only STANDARD
+     * (configured/control) channels get a monitor — dynamically-allocated traffic channels do not, so a live voice
+     * grant has no snapshot here.
+     */
+    private final Map<Channel,ControlChannelQualitySnapshot> mQualityByChannel = new ConcurrentHashMap<>();
+
+    /** Caches each incoming quality snapshot by its Channel. */
+    private final Listener<ControlChannelQualitySnapshot> mQualityListener = snapshot -> {
+        if(snapshot != null && snapshot.channel() != null)
+        {
+            mQualityByChannel.put(snapshot.channel(), snapshot);
+        }
+    };
+
+    /** A quality snapshot older than this (channel stopped / no heartbeat) is treated as absent. */
+    private static final long QUALITY_FRESHNESS_MS = 5_000L;
+
+    /**
      * Constructs the control server.
      * @param tunerManager for tuner discovery and control.
      * @param configurationManager for channel/alias/stream discovery, control and configuration reload.
@@ -213,6 +236,8 @@ public class ControlServer
 
         mEventBuffer = new EventBuffer(mConfigurationManager.getAliasModel());
         mConfigurationManager.getChannelProcessingManager().addDecodeEventListener(mEventBuffer);
+        //Live per-channel decode-health % + signal level for /channels + /status activeCalls.
+        mConfigurationManager.getChannelProcessingManager().addControlChannelQualityListener(mQualityListener);
 
         mExecutor = Executors.newFixedThreadPool(4);
 
@@ -295,6 +320,9 @@ public class ControlServer
             mConfigurationManager.getChannelProcessingManager().removeDecodeEventListener(mEventBuffer);
             mEventBuffer = null;
         }
+
+        mConfigurationManager.getChannelProcessingManager().removeControlChannelQualityListener(mQualityListener);
+        mQualityByChannel.clear();
 
         if(mExecutor != null)
         {
@@ -1377,6 +1405,29 @@ public class ControlServer
         }
     }
 
+    /**
+     * Emits the live decode-health and signal fields for a channel/call entry from the cached quality snapshot:
+     * {@code syncPercent} (0-100 decode health) and {@code signalDbfs} (smoothed signal level, dBFS).  Both are
+     * null when the channel has no fresh snapshot (not a standard/control channel, stopped, or stale &gt;5s) so the
+     * UI can omit the readout rather than show a stale number.
+     */
+    private void putQuality(Map<String,Object> entry, Channel channel)
+    {
+        ControlChannelQualitySnapshot q = channel != null ? mQualityByChannel.get(channel) : null;
+
+        if(q != null && (System.currentTimeMillis() - q.observedAtMs()) <= QUALITY_FRESHNESS_MS)
+        {
+            entry.put("syncPercent", q.decodeHealthPercent());
+            //averageSignalDbfs is steadier than the instantaneous value for a UI bar; fall back to instant.
+            entry.put("signalDbfs", q.averageSignalDbfs() != null ? q.averageSignalDbfs() : q.signalDbfs());
+        }
+        else
+        {
+            entry.put("syncPercent", null);
+            entry.put("signalDbfs", null);
+        }
+    }
+
     private Map<String,Object> buildChannelList()
     {
         ChannelProcessingManager cpm = mConfigurationManager.getChannelProcessingManager();
@@ -1476,6 +1527,7 @@ public class ControlServer
                 entry.put("frequency", null);
             }
 
+            putQuality(entry, channel);
             list.add(entry);
         }
 
@@ -1540,6 +1592,9 @@ public class ControlServer
 
                 call.put("timeslot", meta.getTimeslot());
                 call.put("frequency", frequencyOf(meta));
+
+                //Quality is only tracked for standard (control) channels; a traffic-call row resolves to null.
+                putQuality(call, ch);
 
                 calls.add(call);
             }
