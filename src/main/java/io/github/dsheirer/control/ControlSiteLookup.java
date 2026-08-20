@@ -230,6 +230,7 @@ public class ControlSiteLookup
                 site.put("channels", channels(connection, guid));
                 site.put("neighbors", neighbors(connection, guid));
                 site.put("bands", bands(connection, guid));
+                site.put("patches", patches(connection, guid));
                 site.put("quality", quality(connection, guid));
 
                 sites.add(site);
@@ -299,6 +300,72 @@ public class ControlSiteLookup
     /**
      * Neighboring sites advertised by this site.  NAC is not persisted for neighbors, so no nac field is emitted.
      */
+    /**
+     * Active patch groups at this site, each with the talkgroups patched into it.
+     *
+     * <p>A patch group temporarily merges several talkgroups so they hear one another - common during multi-agency
+     * incidents. Without it a consumer sees traffic split across the member talkgroups with no indication they were
+     * operating as one, so the patch is the only thing that explains the grouping.</p>
+     *
+     * <p>Sourced from {@code p25_site_patch_group} joined to its members in {@code p25_site_patch_group_talkgroup};
+     * both are keyed by site guid. The talkgroup list is emitted nested rather than as a flat cross product so a
+     * patch with no members still appears.</p>
+     */
+    private List<Map<String,Object>> patches(Connection connection, String guid) throws Exception
+    {
+        //patch_group -> member talkgroup ids, collected first so each group carries its own list.
+        Map<Integer,List<Integer>> members = new LinkedHashMap<>();
+
+        String memberSql = "SELECT patch_group, talkgroup_id FROM p25_site_patch_group_talkgroup " +
+                "WHERE guid = ? ORDER BY patch_group, talkgroup_id";
+
+        try(PreparedStatement statement = connection.prepareStatement(memberSql))
+        {
+            statement.setString(1, guid);
+
+            try(ResultSet results = statement.executeQuery())
+            {
+                while(results.next())
+                {
+                    Integer group = nullableInt(results, "patch_group");
+                    Integer talkgroup = nullableInt(results, "talkgroup_id");
+
+                    if(group != null && talkgroup != null)
+                    {
+                        members.computeIfAbsent(group, k -> new ArrayList<>()).add(talkgroup);
+                    }
+                }
+            }
+        }
+
+        List<Map<String,Object>> patches = new ArrayList<>();
+
+        String sql = "SELECT patch_group, version, confirmed_at_ms FROM p25_site_patch_group " +
+                "WHERE guid = ? ORDER BY patch_group";
+
+        try(PreparedStatement statement = connection.prepareStatement(sql))
+        {
+            statement.setString(1, guid);
+
+            try(ResultSet results = statement.executeQuery())
+            {
+                while(results.next())
+                {
+                    Integer group = nullableInt(results, "patch_group");
+                    Map<String,Object> patch = new LinkedHashMap<>();
+                    patch.put("patchGroup", group);
+                    patch.put("version", nullableInt(results, "version"));
+                    patch.put("confirmedAtMs", nullableLong(results, "confirmed_at_ms"));
+                    patch.put("talkgroups", group != null
+                            ? members.getOrDefault(group, List.of()) : List.of());
+                    patches.add(patch);
+                }
+            }
+        }
+
+        return patches;
+    }
+
     private List<Map<String,Object>> neighbors(Connection connection, String guid) throws Exception
     {
         List<Map<String,Object>> neighbors = new ArrayList<>();
