@@ -623,7 +623,62 @@ public class SDRTrunk implements Listener<TunerEvent>
             mLog.warn("headless: starting channels WITHOUT the JMBE codec — control-channel decoding and activity " +
                     "logging work, but decoded voice calls will have no audio until JMBE is installed");
         }
+
+        awaitTunerDiscoveryHeadless();
         return true;
+    }
+
+    /**
+     * Bounded wait for USB tuner discovery to produce at least one available tuner before headless channel
+     * auto-start.
+     *
+     * <p>Tuner enumeration is asynchronous (libusb discovery plus per-device start), and on a cold boot it can
+     * still be in flight when the auto-start pass runs — every channel then fails immediately with "No Tuner
+     * Available" and nothing decodes until the control server's 30s self-heal sweep retries them. Waiting here
+     * costs nothing on a warm start (the tuners are already up, so the first poll returns) and converts that
+     * failed-then-self-healed cold start into a clean one.</p>
+     *
+     * <p>Deliberately does NOT block forever, and never fails the start: a node genuinely running without an SDR
+     * attached must still come up so the control server is reachable and staff can see why.</p>
+     */
+    private void awaitTunerDiscoveryHeadless()
+    {
+        final long timeoutMs = 30_000L;
+        final long pollMs = 250L;
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        boolean waited = false;
+
+        while(mTunerManager.getDiscoveredTunerModel().getAvailableTuners().isEmpty() &&
+              System.currentTimeMillis() < deadline)
+        {
+            if(!waited)
+            {
+                waited = true;
+                mLog.info("headless: waiting for tuner discovery before channel auto-start");
+            }
+
+            try
+            {
+                Thread.sleep(pollMs);
+            }
+            catch(InterruptedException ie)
+            {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+
+        int count = mTunerManager.getDiscoveredTunerModel().getAvailableTuners().size();
+
+        if(count == 0)
+        {
+            mLog.warn("headless: no tuners available after " + (timeoutMs / 1000) +
+                    "s — starting channels anyway; they will fail with 'No Tuner Available' until an SDR appears");
+        }
+        else if(waited)
+        {
+            mLog.info("headless: tuner discovery settled with [" + count + "] available tuner(s)");
+        }
     }
 
     /**
