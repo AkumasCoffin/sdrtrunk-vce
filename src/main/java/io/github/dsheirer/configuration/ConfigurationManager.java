@@ -85,6 +85,20 @@ public class ConfigurationManager implements Listener<ChannelEvent>
     private List<IAliasListRefreshListener> mAliasListRefreshListeners = new ArrayList<>();
 
     /**
+     * Indicates whether an external configuration operation (headless import/reload) is currently in flight.
+     *
+     * Exposed so background work that starts or stops channels can stand down for the duration.  Between
+     * ChannelProcessingManager.shutdown() and transferStateToModels() the channel model still holds the OLD Channel
+     * instances, which are about to be discarded and replaced; anything that starts one during that window creates a
+     * processing chain bound to an orphaned Channel that holds a tuner, is absent from the channel list, and cannot be
+     * stopped through the API — which then makes the NEW channel set fail to acquire a tuner.
+     */
+    public boolean isExternalConfigurationOperationInProgress()
+    {
+        return mExternalConfigurationOperation;
+    }
+
+    /**
      * Manages channel configurations, streams, and alias lists backed by the global SQLite database.
      *
      * Monitors configuration changes to automatically save them after they occur.

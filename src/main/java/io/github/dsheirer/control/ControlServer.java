@@ -2119,6 +2119,18 @@ public class ControlServer
                 return;
             }
 
+            //Never while a config import/reload is in flight.  That operation shuts the processing manager down, swaps
+            //the database, then rebuilds the channel model with NEW Channel instances.  A sweep landing in that window
+            //sees the OLD auto-start channels as "not processing" and starts them — producing a processing chain bound
+            //to a Channel that is about to be discarded.  It holds its tuner, never appears in /channels, cannot be
+            //stopped through the API, and makes the incoming channel set fail with "No Tuner Available", which this
+            //very method then retries forever.  The node stays down after a config push and the logs read like a tuner
+            //fault.  The next sweep (30s) picks up any genuine work once the operation completes.
+            if(mConfigurationManager.isExternalConfigurationOperationInProgress())
+            {
+                return;
+            }
+
             if(mDecodeReadyGate != null && !mDecodeReadyGate.getAsBoolean())
             {
                 return;
