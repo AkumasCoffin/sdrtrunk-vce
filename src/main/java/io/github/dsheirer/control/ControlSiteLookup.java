@@ -555,10 +555,29 @@ public class ControlSiteLookup
     {
         Connection connection = DriverManager.getConnection("jdbc:sqlite:" + mDatabasePath);
 
-        try(Statement statement = connection.createStatement())
+        //Close the connection ourselves if the PRAGMA setup throws — see ControlActivityLookup.openReadOnly() for
+        //why: try(Connection c = openReadOnly()) never binds when the initializer throws, so this leaked a connection
+        //and a SQLite file handle on every poll while the database was locked or mid-migration.
+        try
         {
-            statement.execute("PRAGMA busy_timeout=" + SdrTrunkDatabase.BUSY_TIMEOUT_MILLISECONDS);
-            statement.execute("PRAGMA query_only=ON");
+            try(Statement statement = connection.createStatement())
+            {
+                statement.execute("PRAGMA busy_timeout=" + SdrTrunkDatabase.BUSY_TIMEOUT_MILLISECONDS);
+                statement.execute("PRAGMA query_only=ON");
+            }
+        }
+        catch(Exception e)
+        {
+            try
+            {
+                connection.close();
+            }
+            catch(Exception suppressed)
+            {
+                e.addSuppressed(suppressed);
+            }
+
+            throw e;
         }
 
         return connection;

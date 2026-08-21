@@ -378,10 +378,32 @@ public class ControlActivityLookup
     {
         Connection connection = DriverManager.getConnection("jdbc:sqlite:" + mDatabasePath);
 
-        try(Statement statement = connection.createStatement())
+        //Close the connection ourselves if the PRAGMA setup throws.  The caller writes
+        //try(Connection c = openReadOnly()), which never binds the resource when the initializer throws — so the
+        //connection leaked exactly when the database was locked, corrupt or mid-migration, which is the failure this
+        //class is built to tolerate.  Callers swallow the exception and return an empty result, so the node agent just
+        //retries on its next poll and leaks another connection plus SQLite file handle: fd exhaustion over hours with
+        //only a debug log line as evidence.
+        try
         {
-            statement.execute("PRAGMA busy_timeout=" + SdrTrunkDatabase.BUSY_TIMEOUT_MILLISECONDS);
-            statement.execute("PRAGMA query_only=ON");
+            try(Statement statement = connection.createStatement())
+            {
+                statement.execute("PRAGMA busy_timeout=" + SdrTrunkDatabase.BUSY_TIMEOUT_MILLISECONDS);
+                statement.execute("PRAGMA query_only=ON");
+            }
+        }
+        catch(Exception e)
+        {
+            try
+            {
+                connection.close();
+            }
+            catch(Exception suppressed)
+            {
+                e.addSuppressed(suppressed);
+            }
+
+            throw e;
         }
 
         return connection;

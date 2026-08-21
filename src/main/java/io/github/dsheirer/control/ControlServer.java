@@ -2229,7 +2229,20 @@ public class ControlServer
                     if(ch != null)
                     {
                         Identifier state = meta.getChannelStateIdentifier();
-                        stateByChannel.putIfAbsent(ch, state != null ? state.toString() : null);
+                        String stateText = state != null ? state.toString() : null;
+
+                        //Aggregate across TIMESLOTS: a channel is locked if ANY of its metadata rows is.  DMR and
+                        //P25 Phase 2 produce two rows per Channel, one per timeslot, and putIfAbsent kept whichever
+                        //happened to come first.  When the control lock sat on the row that lost that race, a
+                        //perfectly healthy trunking channel was read as unlocked, accumulated an unlocked streak, and
+                        //logged the "processing but not locked" warning every 5 minutes forever — a permanent false
+                        //alarm on exactly the decoder types this heuristic covers.
+                        String existing = stateByChannel.get(ch);
+
+                        if(existing == null || (!isLockedState(existing) && isLockedState(stateText)))
+                        {
+                            stateByChannel.put(ch, stateText);
+                        }
                     }
                 }
             }
