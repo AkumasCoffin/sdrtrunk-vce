@@ -221,7 +221,10 @@ public class ChannelModel implements Listener<ChannelEvent>
     {
         List<Channel> autoStartChannels = new ArrayList<>();
 
-        for(Channel channel: getChannels())
+        //Copy before iterating: getChannels() is an unmodifiable VIEW of the observable list, so iterating it
+        //directly throws ConcurrentModificationException if a channel is added or removed mid-walk.  This is called
+        //from the control server's HTTP threads and its self-heal sweep, neither of which owns that list.
+        for(Channel channel: new ArrayList<>(getChannels()))
         {
             if(channel.isAutoStart() && ChannelConfigurationPolicy.isActive(channel))
             {

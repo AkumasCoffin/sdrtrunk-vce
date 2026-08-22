@@ -1436,27 +1436,18 @@ public class ControlServer
 
         //Build a channel -> metadata lookup from the live metadata model.
         Map<Channel,ChannelMetadata> metaByChannel = new HashMap<>();
-        int rows = mm.getRowCount();
-
-        for(int r = 0; r < rows; r++)
+        //One locked snapshot instead of walking the live list index-by-index.  The old loop read a plain ArrayList
+        //while the EDT (and the decode threads, via updateChannelMetadataToChannelMap) mutated it, and the catch
+        //below never actually fired — getRowCount()/getChannelMetadata() are bare size()/get() calls with no
+        //modCount check, so the race produced wrong rows rather than an exception.
+        for(Map.Entry<ChannelMetadata,Channel> entry: mm.snapshot())
         {
-            try
-            {
-                ChannelMetadata meta = mm.getChannelMetadata(r);
+            ChannelMetadata meta = entry.getKey();
+            Channel ch = entry.getValue();
 
-                if(meta != null)
-                {
-                    Channel ch = mm.getChannelFromMetadata(meta);
-
-                    if(ch != null)
-                    {
-                        metaByChannel.putIfAbsent(ch, meta);
-                    }
-                }
-            }
-            catch(Exception e)
+            if(meta != null && ch != null)
             {
-                //Metadata list mutates on the EDT - ignore transient index issues.
+                metaByChannel.putIfAbsent(ch, meta);
             }
         }
 
@@ -1546,13 +1537,13 @@ public class ControlServer
     private List<Map<String,Object>> buildActiveCalls(ChannelMetadataModel mm)
     {
         List<Map<String,Object>> calls = new ArrayList<>();
-        int rows = mm.getRowCount();
 
-        for(int r = 0; r < rows; r++)
+        //Locked snapshot, same reasoning as buildChannelList(): walking the live model here attributed calls to the
+        //wrong channel rather than throwing, because the accessors do no modCount checking.
+        for(Map.Entry<ChannelMetadata,Channel> entry: mm.snapshot())
         {
-            try
             {
-                ChannelMetadata meta = mm.getChannelMetadata(r);
+                ChannelMetadata meta = entry.getKey();
 
                 if(meta == null)
                 {
@@ -1573,7 +1564,7 @@ public class ControlServer
                 call.put("state", stateText);
                 call.put("control", "CONTROL".equals(stateText));
 
-                Channel ch = mm.getChannelFromMetadata(meta);
+                Channel ch = entry.getValue();
                 call.put("channelId", ch != null ? ch.getChannelID() : null);
                 call.put("channelName", ch != null ? ch.getName() : null);
 
@@ -1597,10 +1588,6 @@ public class ControlServer
                 putQuality(call, ch);
 
                 calls.add(call);
-            }
-            catch(Exception e)
-            {
-                //Metadata list mutates on the EDT - ignore transient index issues.
             }
         }
 
@@ -2214,17 +2201,18 @@ public class ControlServer
     private Map<Channel,String> buildChannelStateLookup(ChannelMetadataModel mm)
     {
         Map<Channel,String> stateByChannel = new HashMap<>();
-        int rows = mm.getRowCount();
 
-        for(int r = 0; r < rows; r++)
+        //Locked snapshot: this one runs on the self-heal thread, and a torn read here is worse than a cosmetic
+        //glitch — a missed or stale state feeds selfHealChannels() and produces exactly the "processing but not
+        //locked" false alarm the timeslot aggregation below was written to stop.
+        for(Map.Entry<ChannelMetadata,Channel> entry: mm.snapshot())
         {
-            try
             {
-                ChannelMetadata meta = mm.getChannelMetadata(r);
+                ChannelMetadata meta = entry.getKey();
 
                 if(meta != null)
                 {
-                    Channel ch = mm.getChannelFromMetadata(meta);
+                    Channel ch = entry.getValue();
 
                     if(ch != null)
                     {
@@ -2245,10 +2233,6 @@ public class ControlServer
                         }
                     }
                 }
-            }
-            catch(Exception e)
-            {
-                //Metadata list mutates on the EDT - ignore transient index issues.
             }
         }
 

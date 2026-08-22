@@ -433,6 +433,11 @@ public class SDRTrunk implements Listener<TunerEvent>
                 return;
             }
 
+            //Startup-only: give USB enumeration a chance to finish before the first auto-start, so channels don't
+            //fail to source on a cold boot.  Deliberately NOT inside isReadyToDecodeHeadless() — that predicate is
+            //also the control server's decode gate and must never block an HTTP thread.
+            awaitTunerDiscoveryHeadless();
+
             startChannelsWithoutDialog(channels);
             return;
         }
@@ -624,7 +629,13 @@ public class SDRTrunk implements Listener<TunerEvent>
                     "logging work, but decoded voice calls will have no audio until JMBE is installed");
         }
 
-        awaitTunerDiscoveryHeadless();
+        //NOTE: this predicate must stay CHEAP and NON-BLOCKING.  It is handed to the control server as
+        //mDecodeReadyGate and is evaluated on an HTTP worker thread by /config/import and /config/reload.  It used to
+        //call awaitTunerDiscoveryHeadless(), which sleep-polls for up to 30 seconds whenever no tuner is currently
+        //enumerated (USB re-enumeration, unplug, tuner error) — parking HTTP threads out of a pool of four and making
+        //the whole node look offline to the agent while sdrtrunk was decoding perfectly well.  The wait now lives on
+        //the startup path only; the control server's self-heal sweep retries auto-start every 30 seconds, so a cold
+        //start where tuners appear late is still covered.
         return true;
     }
 

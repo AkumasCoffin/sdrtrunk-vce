@@ -27,6 +27,7 @@ import io.github.dsheirer.identifier.decoder.DecoderLogicalChannelNameIdentifier
 import io.github.dsheirer.preference.PreferenceType;
 import io.github.dsheirer.sample.Listener;
 import java.awt.EventQueue;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -53,6 +54,20 @@ public class ChannelMetadataModel extends AbstractTableModel implements IChannel
 
     private transient List<ChannelMetadata> mChannelMetadata = new ArrayList<>();
     private transient Map<ChannelMetadata,Channel> mMetadataChannelMap = new HashMap<>();
+
+    /**
+     * Guards the two collections above for OFF-EDT readers — specifically the headless control server, which serves
+     * /channels and /status from HTTP worker threads while the EDT (and, via updateChannelMetadataToChannelMap(), the
+     * decode threads) mutate them.
+     *
+     * The model's convention is EDT confinement, so the mutations still happen where they always did and Swing's
+     * fireTable* events are untouched; this lock exists purely so snapshot() can hand a consistent copy to a thread
+     * that has no business touching Swing state.  Without it those readers walked a plain ArrayList/HashMap being
+     * structurally modified underneath them: no exception (the getters are bare size()/get() calls with no modCount
+     * check), just wrong answers — a call attributed to the wrong channel, a live call missing from /channels, or a
+     * spurious null from the map mid-resize.  Contended only by the agent's ~1 Hz polls.
+     */
+    private final transient Object mSnapshotLock = new Object();
     private transient Listener<ChannelAndMetadata> mChannelAddListener;
     private transient List<IChannelMetadataUpdateListener> mUpdateListeners = new CopyOnWriteArrayList<>();
 
@@ -162,9 +177,15 @@ public class ChannelMetadataModel extends AbstractTableModel implements IChannel
         EventQueue.invokeLater(() -> {
             for(ChannelMetadata channelMetadata: channelAndMetadata.getChannelMetadata())
             {
-                mChannelMetadata.add(channelMetadata);
-                mMetadataChannelMap.put(channelMetadata, channelAndMetadata.getChannel());
-                int index = mChannelMetadata.indexOf(channelMetadata);
+                int index;
+
+                synchronized(mSnapshotLock)
+                {
+                    mChannelMetadata.add(channelMetadata);
+                    mMetadataChannelMap.put(channelMetadata, channelAndMetadata.getChannel());
+                    index = mChannelMetadata.indexOf(channelMetadata);
+                }
+
                 fireTableRowsInserted(index, index);
                 channelMetadata.setUpdateEventListener(ChannelMetadataModel.this);
             }
@@ -183,9 +204,14 @@ public class ChannelMetadataModel extends AbstractTableModel implements IChannel
      */
     public void updateChannelMetadataToChannelMap(Collection<ChannelMetadata> channelMetadatas, Channel channel)
     {
-        for(ChannelMetadata channelMetadata: channelMetadatas)
+        //NOTE: unlike add()/remove() this runs on a DECODE thread (ChannelProcessingManager's traffic-channel
+        //conversion), not the EDT — so the map is written from two thread families and must take the lock.
+        synchronized(mSnapshotLock)
         {
-            mMetadataChannelMap.put(channelMetadata, channel);
+            for(ChannelMetadata channelMetadata: channelMetadatas)
+            {
+                mMetadataChannelMap.put(channelMetadata, channel);
+            }
         }
     }
 
@@ -214,13 +240,44 @@ public class ChannelMetadataModel extends AbstractTableModel implements IChannel
     private void removeNow(ChannelMetadata channelMetadata)
     {
         channelMetadata.removeUpdateEventListener();
-        int index = mChannelMetadata.indexOf(channelMetadata);
-        mChannelMetadata.remove(channelMetadata);
-        mMetadataChannelMap.remove(channelMetadata);
+
+        int index;
+
+        synchronized(mSnapshotLock)
+        {
+            index = mChannelMetadata.indexOf(channelMetadata);
+            mChannelMetadata.remove(channelMetadata);
+            mMetadataChannelMap.remove(channelMetadata);
+        }
 
         if(index >= 0)
         {
             fireTableRowsDeleted(index, index);
+        }
+    }
+
+    /**
+     * Consistent snapshot of every channel metadata paired with the channel that created it, for readers that are NOT
+     * on the EDT — the headless control server building /channels and /status.
+     *
+     * Returned as a copied list of entries so the caller iterates a stable view rather than racing the live
+     * collections one index at a time.  Entry values may be null (metadata whose channel mapping has not landed yet),
+     * hence SimpleEntry rather than Map.entry().
+     *
+     * @return snapshot of (metadata, owning channel) pairs, never null
+     */
+    public List<Map.Entry<ChannelMetadata,Channel>> snapshot()
+    {
+        synchronized(mSnapshotLock)
+        {
+            List<Map.Entry<ChannelMetadata,Channel>> snapshot = new ArrayList<>(mChannelMetadata.size());
+
+            for(ChannelMetadata channelMetadata: mChannelMetadata)
+            {
+                snapshot.add(new AbstractMap.SimpleEntry<>(channelMetadata, mMetadataChannelMap.get(channelMetadata)));
+            }
+
+            return snapshot;
         }
     }
 
