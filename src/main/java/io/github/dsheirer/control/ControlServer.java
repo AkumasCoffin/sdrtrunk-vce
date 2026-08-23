@@ -239,7 +239,17 @@ public class ControlServer
         //Live per-channel decode-health % + signal level for /channels + /status activeCalls.
         mConfigurationManager.getChannelProcessingManager().addControlChannelQualityListener(mQualityListener);
 
-        mExecutor = Executors.newFixedThreadPool(4);
+        // Four threads was exactly the number of concurrent request streams the
+        // node agent already generates on its own (statusLoop's four sequential
+        // calls at 1Hz while a staff member watches Live, activityship every
+        // 4s, siteship every 60s, and a per-call /activity/call-site). Any
+        // slow handler therefore parked the whole server: a maintenance VACUUM
+        // takes an exclusive SQLite lock, each blocked reader then sits on its
+        // busy timeout, and com.sun.net.httpserver does NOT abort a handler
+        // when the client gives up — so the agent's 4s timeout expired while
+        // the thread stayed parked. The node reported components.sdrtrunk
+        // "unreachable" with nothing server-side to explain it.
+        mExecutor = Executors.newFixedThreadPool(12);
 
         mHttpServer = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), mPort), 0);
         mHttpServer.setExecutor(mExecutor);
@@ -1721,7 +1731,10 @@ public class ControlServer
             }
 
             Map<String,Object> body = new LinkedHashMap<>();
-            body.put("events", mEventBuffer.getEvents(limit));
+            // stop() nulls this; an in-flight /events during shutdown would
+            // otherwise NPE into a 500 rather than an empty result.
+            EventBuffer buffer = mEventBuffer;
+            body.put("events", buffer != null ? buffer.getEvents(limit) : java.util.List.of());
             sendJson(exchange, 200, body);
         }
         catch(Exception e)
@@ -1773,7 +1786,7 @@ public class ControlServer
 
                 try(InputStream is = exchange.getRequestBody())
                 {
-                    bytes = is.readAllBytes();
+                    bytes = readLimited(is);
                 }
 
                 ConfigurationState state;
@@ -1863,6 +1876,15 @@ public class ControlServer
                     new ConfigurationSnapshotDatabaseStore(mDatabasePath).replace(toApply);
                     return null;
                 });
+
+                //A config apply rebuilds the channel model with NEW Channel instances and can retire channel ids
+                //outright, so anything keyed on either is now unreachable but still strongly referenced.
+                //mQualityByChannel is keyed by the Channel OBJECT, so every prior generation's entries were pinned
+                //until stop(); the id-keyed maps were only ever pruned for ids that survived into the new
+                //configuration. Slow growth on a node that gets pushed config often, but growth that never stops.
+                mQualityByChannel.clear();
+                mChannelUnlockedSince.clear();
+                mChannelLastRestart.clear();
 
                 boolean started = startAutoStartChannels();
 
@@ -2495,11 +2517,36 @@ public class ControlServer
         return false;
     }
 
+    /**
+     * Maximum request body this server will buffer.
+     *
+     * The control API is loopback-bound and token-gated, so this is robustness
+     * rather than security: readAllBytes on a runaway or malformed payload
+     * would buffer it whole into the heap of a JVM that is also decoding P25.
+     */
+    private static final int MAXIMUM_BODY_BYTES = 32 * 1024 * 1024;
+
+    /**
+     * Reads a request body, refusing anything past MAXIMUM_BODY_BYTES rather
+     * than growing the heap until something else fails.
+     */
+    private static byte[] readLimited(InputStream is) throws IOException
+    {
+        byte[] bytes = is.readNBytes(MAXIMUM_BODY_BYTES + 1);
+
+        if(bytes.length > MAXIMUM_BODY_BYTES)
+        {
+            throw new IOException("request body exceeds " + MAXIMUM_BODY_BYTES + " bytes");
+        }
+
+        return bytes;
+    }
+
     private JsonNode readBody(HttpExchange exchange) throws IOException
     {
         try(InputStream is = exchange.getRequestBody())
         {
-            byte[] bytes = is.readAllBytes();
+            byte[] bytes = readLimited(is);
 
             if(bytes.length == 0)
             {

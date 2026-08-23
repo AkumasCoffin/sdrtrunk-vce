@@ -138,6 +138,29 @@ import org.slf4j.LoggerFactory;
  */
 public class ControlSiteLookup
 {
+    /**
+     * Ceiling on sites returned by /site/snapshots, and how stale one may be
+     * and still be reported.
+     *
+     * The query had neither, so every neighbour site a node had ever decoded
+     * stayed in the payload forever — and each row costs five further queries
+     * (channels, neighbors, bands, patches, quality) on the same connection,
+     * with the outer ResultSet still open, every 60 seconds.
+     */
+    private static final int MAXIMUM_SITES = 200;
+    private static final long SITE_MAX_AGE_MILLISECONDS = 7L * 24 * 60 * 60 * 1000;
+
+    /**
+     * How long a READ-ONLY lookup waits on a locked database before giving up.
+     *
+     * Deliberately far below the writer's 30s (SdrTrunkDatabase). These queries
+     * are served from a fixed HTTP thread pool and the node agent abandons them
+     * after 4s, but com.sun.net.httpserver does not abort a handler when its
+     * client disconnects — so a long wait here means a thread held for a
+     * request nobody is reading any more, and enough of those park the server.
+     */
+    private static final int READ_BUSY_TIMEOUT_MILLISECONDS = 2000;
+
     private static final Logger mLog = LoggerFactory.getLogger(ControlSiteLookup.class);
 
     private final Path mDatabasePath;
@@ -179,17 +202,31 @@ public class ControlSiteLookup
                 "ORDER BY cc.sort_order LIMIT 1) AS system_name, " +
                 "(SELECT csum.channel_key FROM p25_site_channel_summary csum WHERE csum.guid = s.guid " +
                 "AND csum.downlink_hz IS NOT NULL AND csum.downlink_hz = s.current_control_hz LIMIT 1) AS control_lcn, " +
-                "(SELECT COUNT(DISTINCT aff.radio_id) FROM p25_radio_affiliation aff " +
-                "WHERE aff.system_key = s.system_key) AS affiliated_radio_count " +
+                "COALESCE(affc.n, 0) AS affiliated_radio_count " +
                 "FROM p25_site_snapshot s " +
                 "LEFT JOIN p25_system sys ON sys.system_key = s.system_key " +
+                //Grouped ONCE, not re-counted per site row. As a correlated
+                //subquery this scanned every affiliated radio on the system for
+                //each site returned, every 60 seconds, on one of a small number
+                //of HTTP threads.
+                "LEFT JOIN (SELECT system_key, COUNT(DISTINCT radio_id) AS n " +
+                "FROM p25_radio_affiliation GROUP BY system_key) affc " +
+                "ON affc.system_key = s.system_key " +
                 "WHERE s.site IS NOT NULL " +
-                "ORDER BY s.rfss, s.site";
+                //Bounded. The outer query had no LIMIT and no time floor, so a
+                //node that had ever seen a neighbour site carried it forever,
+                //and each row then cost five more queries below.
+                "AND s.last_seen_ms >= ? " +
+                "ORDER BY s.rfss, s.site " +
+                "LIMIT " + MAXIMUM_SITES;
 
         try(Connection connection = openReadOnly();
-            PreparedStatement statement = connection.prepareStatement(sql);
-            ResultSet results = statement.executeQuery())
+            PreparedStatement statement = connection.prepareStatement(sql))
         {
+            statement.setLong(1, System.currentTimeMillis() - SITE_MAX_AGE_MILLISECONDS);
+
+            try(ResultSet results = statement.executeQuery())
+            {
             while(results.next())
             {
                 String guid = results.getString("guid");
@@ -234,6 +271,7 @@ public class ControlSiteLookup
                 site.put("quality", quality(connection, guid));
 
                 sites.add(site);
+            }
             }
         }
         catch(Exception e)
@@ -562,7 +600,10 @@ public class ControlSiteLookup
         {
             try(Statement statement = connection.createStatement())
             {
-                statement.execute("PRAGMA busy_timeout=" + SdrTrunkDatabase.BUSY_TIMEOUT_MILLISECONDS);
+                // Short, for the same reason as ControlActivityLookup: a
+                // read-only lookup on a bounded pool must not outlive the
+                // client that asked for it.
+                statement.execute("PRAGMA busy_timeout=" + READ_BUSY_TIMEOUT_MILLISECONDS);
                 statement.execute("PRAGMA query_only=ON");
             }
         }

@@ -45,6 +45,17 @@ import org.slf4j.LoggerFactory;
  */
 public class ControlActivityLookup
 {
+    /**
+     * How long a READ-ONLY lookup waits on a locked database before giving up.
+     *
+     * Deliberately far below the writer's 30s (SdrTrunkDatabase). These queries
+     * are served from a fixed HTTP thread pool and the node agent abandons them
+     * after 4s, but com.sun.net.httpserver does not abort a handler when its
+     * client disconnects — so a long wait here means a thread held for a
+     * request nobody is reading any more, and enough of those park the server.
+     */
+    private static final int READ_BUSY_TIMEOUT_MILLISECONDS = 2000;
+
     private static final Logger mLog = LoggerFactory.getLogger(ControlActivityLookup.class);
 
     /**
@@ -231,7 +242,9 @@ public class ControlActivityLookup
                 //P25ActivityLogSchema.insertActivityEventTalkgroupMembers when the target kind is PATCH_GROUP.
                 //Without this the supergroup is all a downstream consumer ever sees, and a patched call cannot say
                 //which channels actually carried it.  Empty string (not null) for an ordinary call, since the
-                //aggregate has no rows to concatenate.
+                //aggregate returns NULL, not an empty string, when there are no
+                //member rows — parsePatchMembers handles both, and the null
+                //branch is the one that actually fires.
                 "(SELECT group_concat(m.talkgroup_id) FROM activity_event_talkgroup_member m " +
                 "WHERE m.event_id = v.id) AS patch_members " +
                 "FROM p25_activity_event_resolved v WHERE v.id > ?" +
@@ -278,10 +291,14 @@ public class ControlActivityLookup
         }
         catch(Exception e)
         {
-            //Busy/locked/missing database - report the empty result so the caller retries on the next poll.
+            //Busy/locked/missing database - report the empty result so the caller retries on the next poll,
+            //but SAY SO. Returning a bare empty list made a persistently locked or corrupt activity database
+            //indistinguishable from a quiet network: the agent saw a valid 200 with no events, logged nothing,
+            //and activity shipping stopped silently and indefinitely with no evidence at either end.
             mLog.debug("Recent-events lookup failed - returning empty result", e);
             events.clear();
             result.put("lastId", sinceId);
+            result.put("error", e.getClass().getSimpleName() + ": " + String.valueOf(e.getMessage()));
         }
 
         return result;
@@ -438,7 +455,11 @@ public class ControlActivityLookup
         {
             try(Statement statement = connection.createStatement())
             {
-                statement.execute("PRAGMA busy_timeout=" + SdrTrunkDatabase.BUSY_TIMEOUT_MILLISECONDS);
+                // A SHORT wait, not the writer's 30s. These are read-only
+                // lookups served on a bounded HTTP pool, and the agent gives up
+                // after 4s — a handler still waiting at 30s is holding a thread
+                // for a client that stopped listening 26 seconds ago.
+                statement.execute("PRAGMA busy_timeout=" + READ_BUSY_TIMEOUT_MILLISECONDS);
                 statement.execute("PRAGMA query_only=ON");
             }
         }
