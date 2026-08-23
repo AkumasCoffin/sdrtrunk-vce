@@ -143,6 +143,46 @@ public class ControlActivityLookup
     }
 
     /**
+     * Parses the group_concat of an event's patched member talkgroups into a list.
+     *
+     * <p>Always a list, never null: an ordinary call has no members and an empty list says exactly that, where a null
+     * would be indistinguishable from an older server that does not report members at all.</p>
+     *
+     * @param concatenated comma-separated talkgroup ids, or null/empty when the call is not patched.
+     * @return member talkgroup ids, ascending and without repeats.
+     */
+    private static List<Integer> parsePatchMembers(String concatenated)
+    {
+        if(concatenated == null || concatenated.isBlank())
+        {
+            return List.of();
+        }
+
+        List<Integer> members = new ArrayList<>();
+
+        for(String part: concatenated.split(","))
+        {
+            try
+            {
+                int value = Integer.parseInt(part.trim());
+
+                if(value > 0 && !members.contains(value))
+                {
+                    members.add(value);
+                }
+            }
+            catch(NumberFormatException e)
+            {
+                //Ignore - a malformed id costs one member, never the event.
+            }
+        }
+
+        members.sort(Integer::compareTo);
+
+        return members;
+    }
+
+    /**
      * Returns detailed activity events newer than the supplied id, in id order, for the node agent's activity feed.
      *
      * <p>Detail rows only exist when the detailed-history preference is enabled.  A busy/locked/missing database
@@ -184,7 +224,16 @@ public class ControlActivityLookup
                 "JOIN trunked_identity_summary tis ON tis.scope_id = tsc.scope_id AND tis.identity_kind_code = 2 " +
                 "AND tis.identity_id = v.source_radio_id " +
                 "WHERE tsc.context_id = v.context_id AND tis.last_talker_alias IS NOT NULL " +
-                "ORDER BY tis.last_talker_alias_seen_ms DESC LIMIT 1) AS source_alias " +
+                "ORDER BY tis.last_talker_alias_seen_ms DESC LIMIT 1) AS source_alias, " +
+                //patchMembers: the talkgroups patched into this call.  A patched transmission carries the PATCH
+                //GROUP as its target_id - a supergroup that is not a talkgroup anyone is scanning - while the real
+                //member talkgroups live one row each in activity_event_talkgroup_member, written by
+                //P25ActivityLogSchema.insertActivityEventTalkgroupMembers when the target kind is PATCH_GROUP.
+                //Without this the supergroup is all a downstream consumer ever sees, and a patched call cannot say
+                //which channels actually carried it.  Empty string (not null) for an ordinary call, since the
+                //aggregate has no rows to concatenate.
+                "(SELECT group_concat(m.talkgroup_id) FROM activity_event_talkgroup_member m " +
+                "WHERE m.event_id = v.id) AS patch_members " +
                 "FROM p25_activity_event_resolved v WHERE v.id > ?" +
                 (callsOnly ? " AND v.event_type_code IN (" + CALL_EVENT_TYPE_CODES + ")" : "") +
                 " ORDER BY v.id ASC LIMIT " + clamped;
@@ -220,6 +269,7 @@ public class ControlActivityLookup
                     event.put("channelName", results.getObject(15));
                     event.put("systemName", results.getObject(16));
                     event.put("sourceAlias", results.getObject(17));
+                    event.put("patchMembers", parsePatchMembers(results.getString(18)));
                     events.add(event);
                 }
             }
