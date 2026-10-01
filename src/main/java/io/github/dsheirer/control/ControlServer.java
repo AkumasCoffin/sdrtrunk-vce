@@ -148,6 +148,21 @@ public class ControlServer
     private final Map<Integer,Long> mChannelLastRestart = new ConcurrentHashMap<>();
 
     /**
+     * Channel NAMES (trimmed) the node agent has deliberately stopped for low decode health.  Self-heal branch (a)
+     * skips these - without this, any agent stop of an autoStart channel is undone within one 30s sweep and the
+     * agent's management loop degenerates into a 30-second restart fight.  Runtime-only by design: names, not ids
+     * (ids are reassigned every reload), never persisted, and cleared whenever a reload/import rebuilds the channel
+     * set and restarts everything anyway - the agent re-evaluates from live state and re-stops after its own dwell.
+     */
+    private final Set<String> mSelfHealSuppressed = ConcurrentHashMap.newKeySet();
+
+    /** channel name -&gt; epoch ms of the last "suppressed, leaving stopped" notice, to keep the 30s sweep log quiet. */
+    private final Map<String,Long> mSuppressedNoticeAt = new ConcurrentHashMap<>();
+
+    /** Interval between repeated "suppressed, leaving stopped" notices for the same channel. */
+    private static final long SUPPRESSED_NOTICE_INTERVAL_MS = 600_000L;
+
+    /**
      * Last gain value applied to each tuner via this control API, keyed by tuner id.  Most SDR-Trunk tuner
      * controllers do not expose a getter for the current composite gain (it is persisted only in the tuner
      * configuration), so buildTunerList reports the last value set through this server as a fallback.  A value
@@ -1472,6 +1487,12 @@ public class ControlServer
             entry.put("system", channel.getSystem());
             entry.put("site", channel.getSite());
             entry.put("type", String.valueOf(channel.getChannelType()));
+            //isAutoStart(), not getAutoStart(): the getter pair exists for the XML/JSON round-trip quirk (see the
+            //import handler); isAutoStart() is the live flag.  "suppressed" lets a freshly restarted (stateless)
+            //node agent recover which channels it auto-stopped from live reality alone.
+            entry.put("autoStart", channel.isAutoStart());
+            entry.put("suppressed",
+                    mSelfHealSuppressed.contains(channel.getName() != null ? channel.getName().trim() : ""));
 
             boolean processing = channel.isProcessing();
             entry.put("processing", processing);
@@ -1689,6 +1710,18 @@ public class ControlServer
                     cpm.stop(target);
                     sendJson(exchange, 200, ok());
                     break;
+                //Agent-stop suppression (see mSelfHealSuppressed).  Orthogonal to start/stop on purpose: the agent
+                //suppresses BEFORE stopping (so a self-heal sweep can't restart the channel in the gap) and keeps the
+                //suppression through its probe restarts (so a sweep can't interfere mid-probe).
+                case "suppress":
+                    mSelfHealSuppressed.add(target.getName() != null ? target.getName().trim() : "");
+                    sendJson(exchange, 200, ok());
+                    break;
+                case "unsuppress":
+                    mSelfHealSuppressed.remove(target.getName() != null ? target.getName().trim() : "");
+                    mSuppressedNoticeAt.remove(target.getName() != null ? target.getName().trim() : "");
+                    sendJson(exchange, 200, ok());
+                    break;
                 default:
                     sendJson(exchange, 404, error("not found"));
                     break;
@@ -1766,6 +1799,10 @@ public class ControlServer
             {
                 //Reloads channel/alias/stream models from the shared SQLite database.
                 mConfigurationManager.applyExternalConfigurationSnapshotHeadless(() -> null);
+
+                //Reload restarts every auto-start channel, same as import: stale suppression would just lie.
+                mSelfHealSuppressed.clear();
+                mSuppressedNoticeAt.clear();
 
                 boolean started = startAutoStartChannels();
 
@@ -1885,6 +1922,10 @@ public class ControlServer
                 mQualityByChannel.clear();
                 mChannelUnlockedSince.clear();
                 mChannelLastRestart.clear();
+                //The import restarts every auto-start channel below, so carrying suppression across it would only
+                //misreport running channels as suppressed.  The agent re-stops after a fresh dwell if still warranted.
+                mSelfHealSuppressed.clear();
+                mSuppressedNoticeAt.clear();
 
                 boolean started = startAutoStartChannels();
 
@@ -2153,10 +2194,27 @@ public class ControlServer
             {
                 int id = channel.getChannelID();
 
-                //(a) Not processing - failed or never started. (Re)start it.
+                //(a) Not processing - failed or never started. (Re)start it... unless the node agent stopped it
+                //on purpose (low decode health) - the agent owns that channel's lifecycle until it unsuppresses.
                 if(!channel.isProcessing())
                 {
                     mChannelUnlockedSince.remove(id);
+
+                    String name = channel.getName() != null ? channel.getName().trim() : "";
+
+                    if(mSelfHealSuppressed.contains(name))
+                    {
+                        long lastNotice = mSuppressedNoticeAt.getOrDefault(name, 0L);
+
+                        if(now - lastNotice >= SUPPRESSED_NOTICE_INTERVAL_MS)
+                        {
+                            mLog.info("self-heal: auto-start channel [" + name +
+                                    "] suppressed by agent (low decode) - leaving stopped");
+                            mSuppressedNoticeAt.put(name, now);
+                        }
+
+                        continue;
+                    }
 
                     try
                     {
