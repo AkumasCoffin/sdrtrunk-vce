@@ -174,7 +174,8 @@ public class ControlServer
      * Latest control-channel quality snapshot per configured channel, keyed by the Channel object the
      * {@link ControlChannelQualityMonitor} was attached to.  Fed by {@link #mQualityListener} (registered on the
      * ChannelProcessingManager in {@link #start()}); read by buildChannelList / buildActiveCalls to emit each
-     * channel's live decode-health % ({@code syncPercent}) and signal level ({@code signalDbfs}).  Only STANDARD
+     * channel's live decode-health % ({@code syncPercent}), signal level ({@code signalDbfs}), how long it has been
+     * decoding ({@code decodingForMs}) and how many frames back the health figure ({@code syncFrames}).  Only STANDARD
      * (configured/control) channels get a monitor — dynamically-allocated traffic channels do not, so a live voice
      * grant has no snapshot here.
      */
@@ -1445,11 +1446,23 @@ public class ControlServer
             entry.put("syncPercent", q.decodeHealthPercent());
             //averageSignalDbfs is steadier than the instantaneous value for a UI bar; fall back to instant.
             entry.put("signalDbfs", q.averageSignalDbfs() != null ? q.averageSignalDbfs() : q.signalDbfs());
+            /*
+             * How long this channel has been decoding, in milliseconds, or null if it has not decoded anything on
+             * this run.  A client measuring a frequency it just started needs to know whether syncPercent is backed
+             * by real decoding yet; without this the only safe answer was to wait out the whole rolling window.
+             * Reported as a DURATION rather than a timestamp so a caller on another machine needs no agreement with
+             * this JVM's clock.  Absent on older runtimes, which is how a client tells it must wait instead.
+             */
+            entry.put("decodingForMs", q.decodingSinceMs() > 0
+                ? Math.max(0, q.observedAtMs() - q.decodingSinceMs()) : null);
+            entry.put("syncFrames", q.validFrames() + q.invalidFrames());
         }
         else
         {
             entry.put("syncPercent", null);
             entry.put("signalDbfs", null);
+            entry.put("decodingForMs", null);
+            entry.put("syncFrames", null);
         }
     }
 

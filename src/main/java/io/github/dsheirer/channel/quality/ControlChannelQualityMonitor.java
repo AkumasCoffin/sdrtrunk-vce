@@ -28,6 +28,13 @@ import java.util.function.Consumer;
 
 /**
  * Collects low-cost trunked control-channel signal and decode measurements on the processing-chain thread.
+ *
+ * ACQUISITION IS NOT A DECODE FAILURE.  A channel that has just started spends a moment with no sync while the
+ * demodulator pulls in, and every bit of it used to be counted as failed decoding — so a perfectly good control
+ * channel read terrible for the first half-minute, until those seconds aged out of the rolling window.  Anything
+ * reading the number had to wait out that window before it meant anything, which is most of a minute per channel
+ * for a caller measuring a list of frequencies.  Nothing is counted now until the channel decodes its first frame:
+ * before that there is no measurement to report, which is both faster and truer than reporting a bad one.
  */
 public class ControlChannelQualityMonitor extends Module implements IMessageListener, ISourceEventListener,
     IHeartbeatListener
@@ -49,6 +56,9 @@ public class ControlChannelQualityMonitor extends Module implements IMessageList
     private long mFrequency;
     private long mLastPublish;
     private long mLastValidDecode;
+    /** Timestamp of this run's FIRST valid frame; 0 until the channel has decoded anything.  Doubles as the
+     *  acquisition gate (nothing is counted before it) and as how long the measurement has been running. */
+    private long mDecodingSince;
     private long mLastLcchKey = Long.MIN_VALUE;
     private double mSignalDbfs = Double.NaN;
     private boolean mRunning;
@@ -152,11 +162,17 @@ public class ControlChannelQualityMonitor extends Module implements IMessageList
         }
         else if(message instanceof SyncLossMessage syncLoss)
         {
-            mCurrent.syncLossBits += Math.max(0, syncLoss.getBitsProcessed());
+            if(mDecodingSince > 0)
+            {
+                mCurrent.syncLossBits += Math.max(0, syncLoss.getBitsProcessed());
+            }
         }
         else if(message instanceof DroppedSamplesMessage dropped)
         {
-            mCurrent.droppedBits += Math.max(0, dropped.getBitsDropped());
+            if(mDecodingSince > 0)
+            {
+                mCurrent.droppedBits += Math.max(0, dropped.getBitsDropped());
+            }
         }
     }
 
@@ -164,8 +180,18 @@ public class ControlChannelQualityMonitor extends Module implements IMessageList
     {
         if(valid)
         {
+            if(mDecodingSince == 0)
+            {
+                mDecodingSince = timestamp > 0 ? timestamp : System.currentTimeMillis();
+            }
+
             mCurrent.validFrames++;
             mLastValidDecode = Math.max(mLastValidDecode, timestamp);
+        }
+        else if(mDecodingSince == 0)
+        {
+            //Still acquiring: this is the demodulator pulling in, not the channel decoding badly.
+            return;
         }
         else
         {
@@ -248,7 +274,8 @@ public class ControlChannelQualityMonitor extends Module implements IMessageList
         Double max = powerCount > 0 ? maximum : null;
         Double current = Double.isFinite(mSignalDbfs) ? mSignalDbfs : null;
         mConsumer.accept(new ControlChannelQualitySnapshot(mChannel, mGuid, mFrequency, now, active, current,
-            average, min, max, health, valid, invalid, corrected, syncLoss, dropped, mLastValidDecode));
+            average, min, max, health, valid, invalid, corrected, syncLoss, dropped, mLastValidDecode,
+            mDecodingSince));
     }
 
     private void publishInactive()
@@ -264,6 +291,7 @@ public class ControlChannelQualityMonitor extends Module implements IMessageList
         mBuckets.clear();
         mCurrent = new Bucket();
         mLastValidDecode = 0;
+        mDecodingSince = 0;
         mLastLcchKey = Long.MIN_VALUE;
         mSignalDbfs = Double.NaN;
         mLastPublish = 0;

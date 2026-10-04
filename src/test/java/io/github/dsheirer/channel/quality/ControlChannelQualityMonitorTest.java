@@ -245,6 +245,95 @@ class ControlChannelQualityMonitorTest
         return message;
     }
 
+    @Test
+    void acquisitionBeforeTheFirstDecodeIsNotCountedAgainstTheChannel()
+    {
+        /*
+         * A channel that has just started has not failed to decode anything — it has not started decoding yet.
+         * Counting the demodulator pulling in as failed frames made a good control channel read terrible until
+         * those seconds aged out of the rolling window, which is why reading the number meant waiting a window
+         * out first.
+         */
+        Channel channel = new Channel("Just Started", ChannelType.STANDARD);
+        channel.setRadresGuid(GUID);
+        channel.setDecodeConfiguration(new DecodeConfigP25Phase2());
+        List<ControlChannelQualitySnapshot> snapshots = new ArrayList<>();
+        ControlChannelQualityMonitor monitor =
+            new ControlChannelQualityMonitor(channel, 856_137_500L, snapshots::add);
+        monitor.start();
+
+        //Acquiring: no sync, nothing decoded yet.
+        monitor.getMessageListener().receive(new SyncLossMessage(1_000L, 4096, Protocol.APCO25_PHASE2));
+        monitor.getMessageListener().receive(new DroppedSamplesMessage(1_001L, 2048, Protocol.APCO25_PHASE2));
+        monitor.getMessageListener().receive(mac(1_002L, 0, false, 8));
+        monitor.publishIfDue(System.currentTimeMillis() + ControlChannelQualityMonitor.PUBLISH_INTERVAL_MILLISECONDS);
+
+        ControlChannelQualitySnapshot acquiring = snapshots.getLast();
+        assertNull(acquiring.decodeHealthPercent(), "nothing decoded yet is no measurement, not a bad one");
+        assertEquals(0, acquiring.syncLossBits());
+        assertEquals(0, acquiring.droppedBits());
+        assertEquals(0, acquiring.invalidFrames());
+        assertEquals(0L, acquiring.decodingSinceMs());
+
+        //Locked: from the first valid frame on, everything counts.
+        monitor.getMessageListener().receive(mac(2_000L, 0, true, 1));
+        monitor.getMessageListener().receive(mac(2_001L, 0, true, 1));
+        monitor.getMessageListener().receive(mac(2_002L, 0, true, 1));
+        monitor.getMessageListener().receive(mac(2_003L, 0, false, 9));
+        monitor.publishIfDue(System.currentTimeMillis() + 2 * ControlChannelQualityMonitor.PUBLISH_INTERVAL_MILLISECONDS);
+
+        ControlChannelQualitySnapshot decoding = snapshots.getLast();
+        assertEquals(75.0, decoding.decodeHealthPercent(), 0.001, "three of four frames decoded");
+        assertEquals(3, decoding.validFrames());
+        assertEquals(1, decoding.invalidFrames());
+        assertEquals(2_000L, decoding.decodingSinceMs(), "decoding began at the first valid frame");
+    }
+
+    @Test
+    void lossAfterLockStillCountsAgainstTheChannel()
+    {
+        //The acquisition gate must not become a licence to ignore a channel that decodes, then stops decoding.
+        Channel channel = new Channel("Fading", ChannelType.STANDARD);
+        channel.setRadresGuid(GUID);
+        channel.setDecodeConfiguration(new DecodeConfigP25Phase2());
+        List<ControlChannelQualitySnapshot> snapshots = new ArrayList<>();
+        ControlChannelQualityMonitor monitor =
+            new ControlChannelQualityMonitor(channel, 856_137_500L, snapshots::add);
+        monitor.start();
+        monitor.getMessageListener().receive(mac(1_000L, 0, true, 1));
+        monitor.getMessageListener().receive(new SyncLossMessage(1_100L, 320, Protocol.APCO25_PHASE2));
+        monitor.publishIfDue(System.currentTimeMillis() + ControlChannelQualityMonitor.PUBLISH_INTERVAL_MILLISECONDS);
+
+        ControlChannelQualitySnapshot snapshot = snapshots.getLast();
+        assertEquals(320, snapshot.syncLossBits());
+        assertEquals(50.0, snapshot.decodeHealthPercent(), 0.001, "one frame decoded, one frame's worth lost");
+    }
+
+    @Test
+    void stoppingForgetsThatItWasEverDecoding()
+    {
+        //Restarting a channel is a fresh measurement: the next run acquires from scratch.
+        Channel channel = new Channel("Restarted", ChannelType.STANDARD);
+        channel.setRadresGuid(GUID);
+        channel.setDecodeConfiguration(new DecodeConfigP25Phase2());
+        List<ControlChannelQualitySnapshot> snapshots = new ArrayList<>();
+        ControlChannelQualityMonitor monitor =
+            new ControlChannelQualityMonitor(channel, 856_137_500L, snapshots::add);
+        monitor.start();
+        monitor.getMessageListener().receive(mac(1_000L, 0, true, 1));
+        monitor.publishIfDue(System.currentTimeMillis() + ControlChannelQualityMonitor.PUBLISH_INTERVAL_MILLISECONDS);
+        assertEquals(1_000L, snapshots.getLast().decodingSinceMs());
+
+        monitor.stop();
+        monitor.start();
+        monitor.getMessageListener().receive(new SyncLossMessage(3_000L, 4096, Protocol.APCO25_PHASE2));
+        monitor.publishIfDue(System.currentTimeMillis() + 3 * ControlChannelQualityMonitor.PUBLISH_INTERVAL_MILLISECONDS);
+
+        ControlChannelQualitySnapshot restarted = snapshots.getLast();
+        assertEquals(0L, restarted.decodingSinceMs(), "a restarted channel has not decoded anything yet");
+        assertNull(restarted.decodeHealthPercent());
+    }
+
     private static SACCHFragment nxdn(long timestamp, LICH lich, boolean valid, int correctedBits)
     {
         CorrectedBinaryMessage bits = new CorrectedBinaryMessage(26);
