@@ -113,6 +113,7 @@ public class ControlServer
     private ControlWebSocketServer mWsServer;
     private ExecutorService mExecutor;
     private EventBuffer mEventBuffer;
+    private GpsBuffer mGpsBuffer;
     private long mStartTime;
 
     //---------------------------------------------------------------------------------------------------------------
@@ -252,6 +253,8 @@ public class ControlServer
 
         mEventBuffer = new EventBuffer(mConfigurationManager.getAliasModel());
         mConfigurationManager.getChannelProcessingManager().addDecodeEventListener(mEventBuffer);
+        mGpsBuffer = new GpsBuffer(mConfigurationManager.getAliasModel());
+        mConfigurationManager.getChannelProcessingManager().addDecodeEventListener(mGpsBuffer);
         //Live per-channel decode-health % + signal level for /channels + /status activeCalls.
         mConfigurationManager.getChannelProcessingManager().addControlChannelQualityListener(mQualityListener);
 
@@ -273,6 +276,7 @@ public class ControlServer
         mHttpServer.createContext("/tuners", this::handleTuners);
         mHttpServer.createContext("/channels", this::handleChannels);
         mHttpServer.createContext("/events", this::handleEvents);
+        mHttpServer.createContext("/gps", this::handleGps);
         mHttpServer.createContext("/playlist", this::handleConfig);
         mHttpServer.createContext("/config", this::handleConfig);
         mHttpServer.createContext("/activity", this::handleActivity);
@@ -347,6 +351,12 @@ public class ControlServer
             mEventBuffer = null;
         }
 
+        if(mGpsBuffer != null)
+        {
+            mConfigurationManager.getChannelProcessingManager().removeDecodeEventListener(mGpsBuffer);
+            mGpsBuffer = null;
+        }
+
         mConfigurationManager.getChannelProcessingManager().removeControlChannelQualityListener(mQualityListener);
         mQualityByChannel.clear();
 
@@ -419,6 +429,14 @@ public class ControlServer
             boolean jmbeInstalled = jmbePath != null && java.nio.file.Files.exists(jmbePath);
             body.put("calibrated", calibrated);
             body.put("jmbeInstalled", jmbeInstalled);
+
+            // Positions decoded since start (see GpsBuffer); the positions themselves are at /gps.
+            GpsBuffer gps = mGpsBuffer;
+
+            if(gps != null)
+            {
+                body.put("gps", gps.summary());
+            }
 
             sendJson(exchange, 200, body);
         }
@@ -1781,6 +1799,52 @@ public class ControlServer
             // otherwise NPE into a 500 rather than an empty result.
             EventBuffer buffer = mEventBuffer;
             body.put("events", buffer != null ? buffer.getEvents(limit) : java.util.List.of());
+            sendJson(exchange, 200, body);
+        }
+        catch(Exception e)
+        {
+            sendError(exchange, e);
+        }
+        finally
+        {
+            exchange.close();
+        }
+    }
+
+    /**
+     * GET /gps?after=&lt;seq&gt;&amp;limit=&lt;n&gt; - the positions decoded after a sequence number, oldest first,
+     * with the buffer's counts.  A poller resumes from the last seq it saw; when summary.startedAtMs changes the
+     * process restarted and the sequence began again at 1.
+     */
+    private void handleGps(HttpExchange exchange)
+    {
+        try
+        {
+            if(!authorize(exchange))
+            {
+                return;
+            }
+
+            Map<String,String> query = parseQuery(exchange.getRequestURI().getRawQuery());
+            long after;
+            int limit;
+
+            try
+            {
+                after = query.containsKey("after") ? Long.parseLong(query.get("after")) : 0;
+                limit = query.containsKey("limit") ? Integer.parseInt(query.get("limit")) : 500;
+            }
+            catch(NumberFormatException nfe)
+            {
+                sendJson(exchange, 400, error("malformed after or limit query parameter"));
+                return;
+            }
+
+            // stop() nulls this; answer an in-flight request during shutdown with an empty result.
+            GpsBuffer buffer = mGpsBuffer;
+            Map<String,Object> body = new LinkedHashMap<>();
+            body.put("positions", buffer != null ? buffer.getPositions(after, limit) : java.util.List.of());
+            body.put("summary", buffer != null ? buffer.summary() : Map.of());
             sendJson(exchange, 200, body);
         }
         catch(Exception e)
