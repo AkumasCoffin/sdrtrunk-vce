@@ -155,6 +155,12 @@ public class P25TrafficChannelManager extends TrafficChannelManager implements I
     //draw on the same tuners: a tuner is taken when one is free and released when the channel goes quiet.
     static final int UPLINK_MONITOR_CHANNEL_LIMIT = 4;
     static final long UPLINK_MONITOR_RETRY_DELAY_MS = 30_000;
+    //Seconds an uplink channel holds its tuner without activity before releasing it.  A downlink
+    //traffic channel uses one second, but a subscriber's packet (its location report) can take several
+    //seconds and may begin a beat after the grant, so with one second the channel dies before the
+    //packet arrives and only the header is ever seen.  This hang time keeps the channel parked on the
+    //uplink long enough to receive a whole packet, and to catch repeats, before the tuner is freed.
+    static final int UPLINK_MONITOR_HANG_TIME_SECONDS = 10;
     private boolean mMonitorUplinks;
     private Queue<Channel> mAvailableUplinkChannelQueue = new LinkedTransferQueue<>();
     private List<Channel> mManagedUplinkChannels = List.of();
@@ -555,7 +561,10 @@ public class P25TrafficChannelManager extends TrafficChannelManager implements I
         for(int x = 0; x < UPLINK_MONITOR_CHANNEL_LIMIT; x++)
         {
             Channel channel = new Channel("U-" + mParentChannel.getName(), ChannelType.TRAFFIC);
-            channel.setDecodeConfiguration(new DecodeConfigP25Conventional());
+            DecodeConfigP25Conventional decodeConfig = new DecodeConfigP25Conventional();
+            //Hold the tuner long enough to receive a whole subscriber packet, not just its header.
+            decodeConfig.setCallTimeoutSeconds(UPLINK_MONITOR_HANG_TIME_SECONDS);
+            channel.setDecodeConfiguration(decodeConfig);
             syncTrafficChannelIdentity(channel);
             channels.add(channel);
         }

@@ -20,6 +20,7 @@ package io.github.dsheirer.module.decode.p25.phase1;
 
 import com.google.common.eventbus.Subscribe;
 import io.github.dsheirer.channel.state.ChangeChannelTimeoutEvent;
+import io.github.dsheirer.module.decode.config.WithCallTimeout;
 import io.github.dsheirer.channel.state.DecoderState;
 import io.github.dsheirer.channel.state.DecoderStateEvent;
 import io.github.dsheirer.channel.state.DecoderStateEvent.Event;
@@ -2359,10 +2360,21 @@ public class P25P1DecoderState extends DecoderState implements IChannelEventList
     {
         super.start();
 
-        //Change the default (45-second) traffic channel timeout to 1 second
+        //A traffic channel is torn down after a period of inactivity to free its tuner.  Downlink
+        //traffic channels use one second (the default here is 45) so a tuner is released the instant a
+        //call ends.  A decode configuration may ask for longer: the uplink monitor's channels do, so
+        //one survives long enough to receive a whole multi-block subscriber packet rather than dying
+        //in the gap before the radio answers.  Honour that request instead of the one-second default.
         if(mChannel.isTrafficChannel())
         {
-            broadcast(new ChangeChannelTimeoutEvent(this, ChannelType.TRAFFIC, 1000));
+            long timeoutMilliseconds = 1000;
+
+            if(mChannel.getDecodeConfiguration() instanceof WithCallTimeout withCallTimeout)
+            {
+                timeoutMilliseconds = withCallTimeout.getCallTimeoutSeconds() * 1000L;
+            }
+
+            broadcast(new ChangeChannelTimeoutEvent(this, ChannelType.TRAFFIC, timeoutMilliseconds));
         }
     }
 

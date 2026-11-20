@@ -386,6 +386,11 @@ class P25TrafficChannelManagerTest
         assertEquals(P25TrafficChannelManager.UPLINK_MONITOR_CHANNEL_LIMIT, uplinks.size());
         assertTrue(uplinks.get(0).getDecodeConfiguration() instanceof DecodeConfigP25Conventional);
         assertTrue(uplinks.get(0).isTrafficChannel());
+
+        //Each uplink channel carries the longer hang time so it holds its tuner long enough to
+        //receive a whole subscriber packet, rather than the one second a downlink traffic channel uses.
+        DecodeConfigP25Conventional uplinkConfig = (DecodeConfigP25Conventional)uplinks.get(0).getDecodeConfiguration();
+        assertEquals(P25TrafficChannelManager.UPLINK_MONITOR_HANG_TIME_SECONDS, uplinkConfig.getCallTimeoutSeconds());
     }
 
     @SuppressWarnings("unchecked")
