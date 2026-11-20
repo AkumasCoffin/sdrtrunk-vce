@@ -35,6 +35,7 @@ public abstract class DecodeConfigP25 extends DecodeConfiguration
     private int mTrafficChannelPoolSize = TRAFFIC_CHANNEL_LIMIT_DEFAULT;
     private boolean mIgnoreDataCalls = false;
     private boolean mLearnAnnouncedControlChannels = false;
+    private boolean mMonitorUplinks = false;
 
     protected DecodeConfigP25()
     {
@@ -48,6 +49,20 @@ public abstract class DecodeConfigP25 extends DecodeConfiguration
     public void setIgnoreDataCalls(boolean ignore)
     {
         mIgnoreDataCalls = ignore;
+    }
+
+    /**
+     * Indicates if the traffic channel manager should also follow each data channel grant onto the subscriber
+     * (inbound) frequency.  Off by default.  See P25TrafficChannelManager.startUplinkMonitor().
+     */
+    public boolean getMonitorUplinks()
+    {
+        return mMonitorUplinks;
+    }
+
+    public void setMonitorUplinks(boolean monitor)
+    {
+        mMonitorUplinks = monitor;
     }
 
     public boolean getLearnAnnouncedControlChannels()

@@ -146,6 +146,20 @@ public class P25TrafficChannelManager extends TrafficChannelManager implements I
     private Listener<IMessage> mMessageListener;
     private boolean mIgnoreDataCalls;
     private ChannelActivityModel mChannelActivityModel;
+
+    //Uplink monitoring.  A data channel grant names a channel pair: the site transmits on the downlink and the
+    //subscriber radios answer on the uplink.  The site does not repeat what it receives on a data channel, so a
+    //subscriber's packets (location reports among them) are only ever on the uplink.  When enabled, each FDMA data
+    //channel grant also starts one of these channels on the uplink frequency.  They are separate from the traffic
+    //channel pools and limited in number so that they can never use up the channels needed for calls, but they do
+    //draw on the same tuners: a tuner is taken when one is free and released when the channel goes quiet.
+    static final int UPLINK_MONITOR_CHANNEL_LIMIT = 4;
+    static final long UPLINK_MONITOR_RETRY_DELAY_MS = 30_000;
+    private boolean mMonitorUplinks;
+    private Queue<Channel> mAvailableUplinkChannelQueue = new LinkedTransferQueue<>();
+    private List<Channel> mManagedUplinkChannels = List.of();
+    private Map<Long,Channel> mAllocatedUplinkChannelMap = new HashMap<>();
+    private long mUplinkRetryAfter;
     //Used only for data calls
     private DecodeEventDuplicateDetector mDuplicateDetector = new DecodeEventDuplicateDetector();
     private final TalkerAliasManager mTalkerAliasManager = new TalkerAliasManager();
@@ -161,14 +175,21 @@ public class P25TrafficChannelManager extends TrafficChannelManager implements I
         if(parentChannel.getDecodeConfiguration() instanceof DecodeConfigP25Phase1 phase1)
         {
             mIgnoreDataCalls = phase1.getIgnoreDataCalls();
+            mMonitorUplinks = phase1.getMonitorUplinks();
             createPhase1TrafficChannels(phase1.getTrafficChannelPoolSize(), phase1);
             createPhase2TrafficChannels(phase1.getTrafficChannelPoolSize(), new DecodeConfigP25Phase2());
         }
         else if(parentChannel.getDecodeConfiguration() instanceof DecodeConfigP25Phase2 phase2)
         {
             mIgnoreDataCalls = phase2.getIgnoreDataCalls();
+            mMonitorUplinks = phase2.getMonitorUplinks();
             createPhase1TrafficChannels(phase2.getTrafficChannelPoolSize(), new DecodeConfigP25Phase1());
             createPhase2TrafficChannels(phase2.getTrafficChannelPoolSize(), phase2);
+        }
+
+        if(mMonitorUplinks)
+        {
+            createUplinkChannels();
         }
     }
 
@@ -444,6 +465,12 @@ public class P25TrafficChannelManager extends TrafficChannelManager implements I
                 }
             }
 
+            //The uplinks being monitored belong to the previous control channel's site as well.
+            for(Channel uplinkChannel : new ArrayList<>(mAllocatedUplinkChannelMap.values()))
+            {
+                broadcast(new ChannelEvent(uplinkChannel, Event.REQUEST_DISABLE));
+            }
+
             mTS1ChannelGrantEventMap.clear();
             mTS2ChannelGrantEventMap.clear();
             //Band identifiers are scoped to the current control channel.  Wait for fresh IDEN updates after a switch.
@@ -513,6 +540,100 @@ public class P25TrafficChannelManager extends TrafficChannelManager implements I
             mAvailablePhase2TrafficChannelQueue.addAll(trafficChannelList);
             mManagedPhase2TrafficChannels = Collections.unmodifiableList(trafficChannelList);
         }
+    }
+
+    /**
+     * Creates the channels used to monitor data channel uplinks.  Each decodes as a conventional (single frequency)
+     * P25 Phase 1 channel: that decoder processes whatever is on the frequency, packet data included, and keeps its
+     * call tracking to itself, so nothing heard on an uplink can disturb the tracking of this site's calls.
+     * Subscriber radios transmit C4FM, which is that decoder's default.
+     */
+    private void createUplinkChannels()
+    {
+        List<Channel> channels = new ArrayList<>();
+
+        for(int x = 0; x < UPLINK_MONITOR_CHANNEL_LIMIT; x++)
+        {
+            Channel channel = new Channel("U-" + mParentChannel.getName(), ChannelType.TRAFFIC);
+            channel.setDecodeConfiguration(new DecodeConfigP25Conventional());
+            syncTrafficChannelIdentity(channel);
+            channels.add(channel);
+        }
+
+        mAvailableUplinkChannelQueue.addAll(channels);
+        mManagedUplinkChannels = Collections.unmodifiableList(channels);
+    }
+
+    /**
+     * The uplink frequency to monitor for a granted data channel, or zero when there is none to monitor: the channel
+     * is TDMA (a Phase 2 uplink is a different waveform that the Phase 1 decoder cannot process), its frequency band
+     * is not known yet, it has no separate uplink, or the uplink is the control channel.
+     *
+     * @param channel that was granted
+     * @param controlFrequency of the current control channel
+     * @return uplink frequency in hertz, or zero
+     */
+    static long uplinkFrequencyFor(APCO25Channel channel, long controlFrequency)
+    {
+        if(channel == null || channel.isTDMAChannel() || !P25FrequencyBandValidator.isResolvedChannel(channel) ||
+            !channel.getValue().hasUplinkChannel())
+        {
+            return 0;
+        }
+
+        long uplink = channel.getUplinkFrequency();
+
+        if(uplink <= 0 || uplink == channel.getDownlinkFrequency() || uplink == controlFrequency)
+        {
+            return 0;
+        }
+
+        return uplink;
+    }
+
+    /**
+     * Starts monitoring the uplink of a granted FDMA data channel, when uplink monitoring is enabled and that uplink
+     * is not already being monitored.  Does nothing when every uplink channel is in use, or for a while after a start
+     * was rejected for want of a tuner, so a site with no tuner to spare is not asked again on every grant.
+     *
+     * Note: this method is not thread safe and the calling method must protect access using mLock.
+     *
+     * @param apco25Channel that was granted
+     */
+    private void startUplinkMonitor(APCO25Channel apco25Channel)
+    {
+        if(!mMonitorUplinks || getInterModuleEventBus() == null || System.currentTimeMillis() < mUplinkRetryAfter)
+        {
+            return;
+        }
+
+        long uplink = uplinkFrequencyFor(apco25Channel, getCurrentControlFrequency());
+
+        if(uplink == 0 || mAllocatedUplinkChannelMap.containsKey(uplink))
+        {
+            return;
+        }
+
+        Channel channel = mAvailableUplinkChannelQueue.poll();
+
+        if(channel == null)
+        {
+            return;
+        }
+
+        syncTrafficChannelIdentity(channel);
+
+        //No preferred tuner: the uplink is far from the site's downlinks, so whichever tuner is free takes it.
+        SourceConfigTuner sourceConfig = new SourceConfigTuner();
+        sourceConfig.setFrequency(uplink);
+        channel.setSourceConfiguration(sourceConfig);
+
+        mAllocatedUplinkChannelMap.put(uplink, channel);
+
+        ChannelStartProcessingRequest request = new ChannelStartProcessingRequest(channel, apco25Channel,
+            new IdentifierCollection(), this);
+        request.addPreloadDataContent(new P25FrequencyBandPreloadDataContent(mFrequencyBandMap.values()));
+        getInterModuleEventBus().post(request);
     }
 
     private Channel createTrafficChannel(DecodeConfiguration decodeConfiguration)
@@ -1877,6 +1998,13 @@ public class P25TrafficChannelManager extends TrafficChannelManager implements I
                                                   boolean controlContinuation)
     {
         long frequency = apco25Channel.getDownlinkFrequency();
+
+        if(isDataChannelGrant)
+        {
+            //Wanted whether or not the downlink of the data channel is followed (see mIgnoreDataCalls below).
+            startUplinkMonitor(apco25Channel);
+        }
+
         P25TrafficChannelEventTracker tracker = controlContinuation ?
             getControlContinuationTracker(frequency, TimeslotMessage.TIMESLOT_1, timestamp) :
             getTrackerRemoveIfStale(frequency, TimeslotMessage.TIMESLOT_1, timestamp);
@@ -2318,8 +2446,15 @@ public class P25TrafficChannelManager extends TrafficChannelManager implements I
             broadcast(new ChannelEvent(channel, Event.REQUEST_DISABLE));
         }
 
+        for(Channel channel: new ArrayList<>(mAllocatedUplinkChannelMap.values()))
+        {
+            mLog.info("Stopping uplink channel: {}", channel);
+            broadcast(new ChannelEvent(channel, Event.REQUEST_DISABLE));
+        }
+
         mAvailablePhase1TrafficChannelQueue.clear();
         mAvailablePhase2TrafficChannelQueue.clear();
+        mAvailableUplinkChannelQueue.clear();
         mTS1ChannelGrantEventMap.clear();
         mTS2ChannelGrantEventMap.clear();
         mFrequencyBandMap.clear();
@@ -2425,6 +2560,19 @@ public class P25TrafficChannelManager extends TrafficChannelManager implements I
     }
 
     /**
+     * Returns an uplink channel to the available queue once it is no longer allocated to a frequency.
+     *
+     * Note: this method is not thread safe and the calling method must protect access using mLock.
+     */
+    private void releaseUplinkChannel(Channel channel)
+    {
+        if(mAllocatedUplinkChannelMap.values().remove(channel))
+        {
+            mAvailableUplinkChannelQueue.add(channel);
+        }
+    }
+
+    /**
      * Monitors channel teardown events to detect when traffic channel processing has ended or channel start has been
      * rejected.  Reclaims the traffic channel instance for reuse by future traffic channel grants.
      */
@@ -2440,6 +2588,34 @@ public class P25TrafficChannelManager extends TrafficChannelManager implements I
         public void receive(ChannelEvent channelEvent)
         {
             Channel channel = channelEvent.getChannel();
+
+            if(mManagedUplinkChannels.contains(channel))
+            {
+                mLock.lock();
+
+                try
+                {
+                    switch(channelEvent.getEvent())
+                    {
+                        case NOTIFICATION_PROCESSING_START_REJECTED:
+                            //No tuner was free.  Leave the uplinks alone for a while instead of asking on each grant.
+                            mUplinkRetryAfter = System.currentTimeMillis() + UPLINK_MONITOR_RETRY_DELAY_MS;
+                            releaseUplinkChannel(channel);
+                            break;
+                        case NOTIFICATION_PROCESSING_STOP:
+                            releaseUplinkChannel(channel);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                finally
+                {
+                    mLock.unlock();
+                }
+
+                return;
+            }
 
             if(mManagedPhase1TrafficChannels.contains(channel))
             {

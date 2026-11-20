@@ -29,6 +29,7 @@ import io.github.dsheirer.module.decode.p25.identifier.radio.APCO25FullyQualifie
 import io.github.dsheirer.module.decode.p25.identifier.radio.APCO25RadioIdentifier;
 import io.github.dsheirer.module.decode.p25.identifier.talkgroup.APCO25Talkgroup;
 import io.github.dsheirer.module.decode.p25.phase1.DecodeConfigP25Conventional;
+import io.github.dsheirer.module.decode.p25.phase1.DecodeConfigP25Phase1;
 import io.github.dsheirer.module.decode.p25.phase1.message.tsbk.Opcode;
 import io.github.dsheirer.module.decode.p25.reference.VoiceServiceOptions;
 import io.github.dsheirer.module.decode.traffic.TrunkedTalkerAliasEvent;
@@ -325,6 +326,82 @@ class P25TrafficChannelManagerTest
         manager.processP1ControlAnnouncedTrafficUpdate(channel, null, updateIdentifiers,
             Opcode.OSP_GROUP_VOICE_CHANNEL_GRANT_UPDATE, 7_200L);
         assertNotSame(initial, trafficTrackers(manager).get(frequency));
+    }
+
+    @Test
+    void uplinkOfAnFdmaDataChannelIsTheDownlinkPlusTheBandTransmitOffset()
+    {
+        //NSW PSN band 4: base 412.475 MHz, 6.25 kHz spacing, subscribers transmit 9.45 MHz below the site.
+        APCO25Channel channel = APCO25Channel.create(4, 378);
+        channel.setFrequencyBand(new P25FrequencyBand(4, 412_475_000L, -9_450_000L, 6_250L, 12_500, 1));
+        assertEquals(414_837_500L, channel.getDownlinkFrequency());
+        assertEquals(405_387_500L, P25TrafficChannelManager.uplinkFrequencyFor(channel, 419_000_000L));
+    }
+
+    @Test
+    void thereIsNoUplinkToMonitorWithoutAConfirmedBandOrOnTdmaOrOnTheControlChannel()
+    {
+        //Frequency band not received yet: the uplink cannot be known.
+        assertEquals(0L, P25TrafficChannelManager.uplinkFrequencyFor(APCO25Channel.create(4, 378), 419_000_000L));
+        assertEquals(0L, P25TrafficChannelManager.uplinkFrequencyFor(null, 419_000_000L));
+
+        //A two-timeslot (Phase 2) channel: its uplink is a waveform the Phase 1 decoder cannot process.
+        APCO25Channel tdma = APCO25Channel.create(6, 378);
+        tdma.setFrequencyBand(new P25FrequencyBand(6, 412_475_000L, -9_450_000L, 12_500L, 12_500, 2));
+        assertEquals(0L, P25TrafficChannelManager.uplinkFrequencyFor(tdma, 419_000_000L));
+
+        //A band with no transmit offset has no separate uplink.
+        APCO25Channel simplex = APCO25Channel.create(4, 378);
+        simplex.setFrequencyBand(new P25FrequencyBand(4, 412_475_000L, 0L, 6_250L, 12_500, 1));
+        assertEquals(0L, P25TrafficChannelManager.uplinkFrequencyFor(simplex, 419_000_000L));
+
+        //Never the control channel.
+        APCO25Channel channel = APCO25Channel.create(4, 378);
+        channel.setFrequencyBand(new P25FrequencyBand(4, 412_475_000L, -9_450_000L, 6_250L, 12_500, 1));
+        assertEquals(0L, P25TrafficChannelManager.uplinkFrequencyFor(channel, 405_387_500L));
+    }
+
+    @Test
+    void dataGrantLeavesUplinksAloneUnlessMonitoringIsEnabled() throws Exception
+    {
+        APCO25Channel channel = APCO25Channel.create(4, 378);
+        channel.setFrequencyBand(new P25FrequencyBand(4, 412_475_000L, -9_450_000L, 6_250L, 12_500, 1));
+
+        //Default configuration: the flag is off and no uplink channels exist.
+        Channel parent = new Channel("Control");
+        parent.setDecodeConfiguration(new DecodeConfigP25Phase1());
+        P25TrafficChannelManager manager = new P25TrafficChannelManager(parent);
+        assertTrue(uplinkChannels(manager).isEmpty());
+        manager.processP1ControlDirectedChannelGrant(channel, null, identifiers(1201, null),
+            Opcode.OSP_SNDCP_DATA_CHANNEL_GRANT, 1_000L);
+        assertTrue(allocatedUplinks(manager).isEmpty());
+
+        //Enabled: a small fixed set of uplink channels, each a single-frequency P25 decoder.
+        DecodeConfigP25Phase1 monitoring = new DecodeConfigP25Phase1();
+        monitoring.setMonitorUplinks(true);
+        Channel monitoredParent = new Channel("Control");
+        monitoredParent.setDecodeConfiguration(monitoring);
+        P25TrafficChannelManager monitored = new P25TrafficChannelManager(monitoredParent);
+        List<Channel> uplinks = uplinkChannels(monitored);
+        assertEquals(P25TrafficChannelManager.UPLINK_MONITOR_CHANNEL_LIMIT, uplinks.size());
+        assertTrue(uplinks.get(0).getDecodeConfiguration() instanceof DecodeConfigP25Conventional);
+        assertTrue(uplinks.get(0).isTrafficChannel());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Channel> uplinkChannels(P25TrafficChannelManager manager) throws Exception
+    {
+        Field field = P25TrafficChannelManager.class.getDeclaredField("mManagedUplinkChannels");
+        field.setAccessible(true);
+        return (List<Channel>)field.get(manager);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<Long,Channel> allocatedUplinks(P25TrafficChannelManager manager) throws Exception
+    {
+        Field field = P25TrafficChannelManager.class.getDeclaredField("mAllocatedUplinkChannelMap");
+        field.setAccessible(true);
+        return (Map<Long,Channel>)field.get(manager);
     }
 
     @SuppressWarnings("unchecked")
