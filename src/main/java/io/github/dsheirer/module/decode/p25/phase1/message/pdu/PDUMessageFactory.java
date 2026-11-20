@@ -110,6 +110,15 @@ public class PDUMessageFactory
             case RESPONSE_PACKET_HEADER_FORMAT:
                 return new ResponseMessage(pduSequence, nac, timestamp);
             case UNCONFIRMED_MULTI_BLOCK_TRUNKING_CONTROL:
+                //When the unconfirmed data header carries a packet data SAP, PDUHeaderFactory produced a
+                //PacketHeader, so decode the blocks as an (IP) packet exactly like confirmed packet data -
+                //this is how an LRRP location report sent as unconfirmed data becomes a position (upstream
+                //sdrtrunk #2506).  Otherwise it is genuine unconfirmed trunking control.
+                if(pduSequence.getHeader() instanceof PacketHeader)
+                {
+                    return createPacketData(pduSequence, nac, timestamp);
+                }
+
                 return createUMBTC(pduSequence, nac, timestamp);
             default:
                 return new PDUSequenceMessage(pduSequence, nac, timestamp);
