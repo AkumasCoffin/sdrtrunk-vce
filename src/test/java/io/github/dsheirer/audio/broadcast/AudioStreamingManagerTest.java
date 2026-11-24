@@ -225,6 +225,54 @@ public class AudioStreamingManagerTest
     }
 
     /**
+     * A non-patch call whose frozen broadcast channel set still carries a stale channel - one routed only by a
+     * PREVIOUS talkgroup that leaked via the never-pruned accumulation - must be streamed only to the stream(s) its
+     * final TO talkgroup actually routes to. The stale channel must be dropped, not uploaded with the current TO.
+     */
+    @Test
+    void nonPatchCallDropsStaleBroadcastChannels() throws Exception
+    {
+        List<AudioRecording> recordings = new CopyOnWriteArrayList<>();
+        CountDownLatch recordingLatch = new CountDownLatch(1);
+        CountDownLatch metricLatch = new CountDownLatch(1);
+        UserPreferences userPreferences = new UserPreferences();
+        AudioStreamingManager manager = new AudioStreamingManager(recording -> {
+            recordings.add(recording);
+            recordingLatch.countDown();
+        }, BroadcastFormat.MP3, userPreferences, _ -> metricLatch.countDown());
+
+        manager.start();
+        manager.receive(getStaleChannelNonPatchCall());
+
+        try
+        {
+            assertTrue(recordingLatch.await(5, TimeUnit.SECONDS), "Expected one streamed recording for the final TO");
+            assertTrue(metricLatch.await(5, TimeUnit.SECONDS), "Expected the completed call streaming metric");
+            manager.stop();
+
+            assertEquals(1, recordings.size(), "A non-patch call must stream once, to its final TO's stream only");
+
+            Set<String> streamedChannels = new HashSet<>();
+
+            for(AudioRecording recording : recordings)
+            {
+                for(BroadcastChannel broadcastChannel : recording.getBroadcastChannels())
+                {
+                    streamedChannels.add(broadcastChannel.getChannelName());
+                }
+            }
+
+            assertEquals(Set.of("Stream B"), streamedChannels,
+                "The stale 'Stream A' channel (routed only by a previous talkgroup) must be dropped");
+        }
+        finally
+        {
+            manager.stop();
+            cleanupStreamingDirectory(userPreferences.getDirectoryPreference().getDirectoryStreaming());
+        }
+    }
+
+    /**
      * Cleanup any generated streaming recordings.
      * @param streamingDirectory
      */
@@ -274,6 +322,52 @@ public class AudioStreamingManagerTest
         long now = System.currentTimeMillis();
         AudioCallSnapshot snapshot = new AudioCallSnapshot(
             new AudioCallId(1L, 1L, TimeslotMessage.TIMESLOT_0),
+            null,
+            aliasList,
+            identifierCollection,
+            broadcastChannels,
+            now,
+            now,
+            1,
+            1,
+            now,
+            now,
+            false,
+            true,
+            false,
+            false,
+            100,
+            false);
+        return new CompletedAudioCall(snapshot, audioBuffers);
+    }
+
+    /**
+     * A non-patch completed call: final TO = talkgroup 200 (routes to Stream B via {@link #getAliasList()}), plus a
+     * FROM radio. The frozen broadcast channel set still carries 'Stream A' - the channel of a previous talkgroup
+     * (100) that leaked through the never-pruned accumulation - alongside the correct 'Stream B'.
+     */
+    private static CompletedAudioCall getStaleChannelNonPatchCall()
+    {
+        AliasList aliasList = getAliasList();
+        List<float[]> audioBuffers = new ArrayList<>();
+        ScalarRealOscillator oscillator = new ScalarRealOscillator(1000, 8000);
+        for(int x = 0; x < 100; x++)
+        {
+            audioBuffers.add(oscillator.generate(500));
+        }
+
+        MutableIdentifierCollection identifierCollection = new MutableIdentifierCollection();
+        identifierCollection.setTimeslot(TimeslotMessage.TIMESLOT_0);
+        identifierCollection.update(APCO25Talkgroup.create(TALKGROUP_2));
+        identifierCollection.update(getRadio());
+
+        Set<BroadcastChannel> broadcastChannels = new HashSet<>();
+        broadcastChannels.add(new BroadcastChannel("Stream A"));
+        broadcastChannels.add(new BroadcastChannel("Stream B"));
+
+        long now = System.currentTimeMillis();
+        AudioCallSnapshot snapshot = new AudioCallSnapshot(
+            new AudioCallId(3L, 1L, TimeslotMessage.TIMESLOT_0),
             null,
             aliasList,
             identifierCollection,

@@ -276,6 +276,85 @@ public class AudioStreamingManager
             return sentToStreamer;
         }
 
+        /**
+         * Restricts a completed non-patch call's frozen broadcast channel set to only the channels that an alias of
+         * the call's final TO identifier routes to.
+         *
+         * A call accumulates a broadcast channel for every identifier the module ever saw while the call was open
+         * (see MutableAudioCallBuilder). When a terminator is missed, or a new call is seeded from a stale identifier
+         * collection, a previous talkgroup's TO can leave its broadcast channel in the frozen set. Streaming to that
+         * raw set then uploads the call to a stream that belongs to the PREVIOUS talkgroup, tagged with the CURRENT
+         * TO. Recomputing the channel set from the final TO keeps the call only on the stream(s) its own talkgroup
+         * actually routes to. Patch groups are handled separately (see {@link #processPatchGroupTalkgroups}) and never
+         * reach this method.
+         *
+         * Never drops the call to zero channels when the final TO does route somewhere: if the TO's routed channels
+         * are (unexpectedly) absent from the frozen set, the TO alias channels are used directly.
+         */
+        private Set<BroadcastChannel> broadcastChannelsForTo(CompletedAudioCall completedAudioCall,
+                                                             IdentifierCollection identifiers)
+        {
+            Map<String, BroadcastChannel> frozenChannels =
+                indexFrozenBroadcastChannels(completedAudioCall.snapshot().broadcastChannels());
+            Identifier toIdentifier = identifiers.getToIdentifier();
+            AliasList aliasList = completedAudioCall.snapshot().aliasList();
+
+            //Nothing to filter against, or no TO/alias list to filter by: preserve prior behaviour.
+            if(frozenChannels.isEmpty() || toIdentifier == null || aliasList == null)
+            {
+                return Set.copyOf(frozenChannels.values());
+            }
+
+            //Routing keys that an alias of the final TO identifier routes to.
+            Set<String> toRoutingKeys = new TreeSet<>();
+
+            for(Alias alias : aliasList.getAliases(toIdentifier))
+            {
+                for(BroadcastChannel broadcastChannel : alias.getBroadcastChannels())
+                {
+                    String routingKey = normalizeRoutingKey(broadcastChannel);
+
+                    if(routingKey != null)
+                    {
+                        toRoutingKeys.add(routingKey);
+                    }
+                }
+            }
+
+            //Keep only the frozen channels the final TO routes to; collect the rest as stale drops.
+            Set<BroadcastChannel> keptChannels = new LinkedHashSet<>();
+            Set<String> droppedKeys = new TreeSet<>();
+
+            for(Map.Entry<String, BroadcastChannel> entry : frozenChannels.entrySet())
+            {
+                if(toRoutingKeys.contains(entry.getKey()))
+                {
+                    keptChannels.add(entry.getValue());
+                }
+                else
+                {
+                    droppedKeys.add(entry.getKey());
+                }
+            }
+
+            //Never drop the call entirely when the final TO does route somewhere.
+            if(keptChannels.isEmpty() && !toRoutingKeys.isEmpty())
+            {
+                for(Alias alias : aliasList.getAliases(toIdentifier))
+                {
+                    keptChannels.addAll(alias.getBroadcastChannels());
+                }
+            }
+
+            if(!droppedKeys.isEmpty() && mLog.isDebugEnabled())
+            {
+                mLog.debug("Dropped stale broadcast channel(s) " + droppedKeys + " from call with final TO [" +
+                    toIdentifier + "] - those channels are routed only by a previous talkgroup's alias");
+            }
+
+            return Set.copyOf(keptChannels);
+        }
+
         private Map<String, BroadcastChannel> indexFrozenBroadcastChannels(
             Set<BroadcastChannel> broadcastChannels)
         {
@@ -377,7 +456,7 @@ public class AudioStreamingManager
                         else
                         {
                             sentToStreamer |= processAudioCall(completedAudioCall, identifiers,
-                                completedAudioCall.snapshot().broadcastChannels());
+                                broadcastChannelsForTo(completedAudioCall, identifiers));
                         }
                     }
                 }

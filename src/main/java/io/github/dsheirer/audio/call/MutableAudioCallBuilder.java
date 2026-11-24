@@ -330,13 +330,37 @@ public class MutableAudioCallBuilder implements Listener<IdentifierUpdateNotific
                 mRecordAudio = true;
             }
 
-            mBroadcastChannels.addAll(alias.getBroadcastChannels());
-
             int playbackPriority = alias.getPlaybackPriority();
 
             if(playbackPriority < mMonitorPriority)
             {
                 mMonitorPriority = playbackPriority;
+            }
+        }
+
+        //Rebuild the broadcast channel set from the identifiers currently in the collection. A TO identifier
+        //replacing a prior different TO (via mIdentifierCollection.update() above) removes the prior TO from the
+        //collection, so the prior TO's broadcast channels must not linger here - otherwise the call streams to a
+        //previous talkgroup's stream. Rebuilding (rather than accumulating) keeps the set in step with the live
+        //TO/FROM identifiers.
+        rebuildBroadcastChannels();
+    }
+
+    /**
+     * Rebuilds {@link #mBroadcastChannels} from the aliases of the identifiers currently resident in the
+     * identifier collection, discarding channels contributed by identifiers that have since been replaced
+     * (e.g. a previous call's TO talkgroup). Recordable and monitor-priority state are intentionally sticky and
+     * are not recomputed here.
+     */
+    private void rebuildBroadcastChannels()
+    {
+        mBroadcastChannels.clear();
+
+        for(Identifier<?> identifier : mIdentifierCollection.getIdentifiers())
+        {
+            for(Alias alias : mAliasList.getAliases(identifier))
+            {
+                mBroadcastChannels.addAll(alias.getBroadcastChannels());
             }
         }
     }
