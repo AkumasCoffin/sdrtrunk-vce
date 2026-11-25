@@ -24,6 +24,7 @@ import io.github.dsheirer.alias.AliasList;
 import io.github.dsheirer.alias.AliasListDefinition;
 import io.github.dsheirer.alias.AliasListFamily;
 import io.github.dsheirer.alias.id.broadcast.BroadcastChannel;
+import io.github.dsheirer.alias.id.radio.Radio;
 import io.github.dsheirer.alias.id.talkgroup.Talkgroup;
 import io.github.dsheirer.audio.call.AudioCallId;
 import io.github.dsheirer.audio.call.AudioCallSnapshot;
@@ -272,6 +273,49 @@ public class AudioStreamingManagerTest
         }
     }
 
+    @Test
+    void nonPatchCallKeepsFromRoutedBroadcastChannel() throws Exception
+    {
+        List<AudioRecording> recordings = new CopyOnWriteArrayList<>();
+        CountDownLatch recordingLatch = new CountDownLatch(1);
+        CountDownLatch metricLatch = new CountDownLatch(1);
+        UserPreferences userPreferences = new UserPreferences();
+        AudioStreamingManager manager = new AudioStreamingManager(recording -> {
+            recordings.add(recording);
+            recordingLatch.countDown();
+        }, BroadcastFormat.MP3, userPreferences, _ -> metricLatch.countDown());
+
+        manager.start();
+        manager.receive(getFromRoutedNonPatchCall());
+
+        try
+        {
+            assertTrue(recordingLatch.await(5, TimeUnit.SECONDS), "Expected one streamed recording");
+            assertTrue(metricLatch.await(5, TimeUnit.SECONDS), "Expected the completed call streaming metric");
+            manager.stop();
+
+            assertEquals(1, recordings.size(), "A non-patch call must stream once");
+
+            Set<String> streamedChannels = new HashSet<>();
+
+            for(AudioRecording recording : recordings)
+            {
+                for(BroadcastChannel broadcastChannel : recording.getBroadcastChannels())
+                {
+                    streamedChannels.add(broadcastChannel.getChannelName());
+                }
+            }
+
+            assertEquals(Set.of("Stream B", "Radio Stream"), streamedChannels,
+                "A channel routed by the FROM/radio alias must survive, not just the TO talkgroup's stream");
+        }
+        finally
+        {
+            manager.stop();
+            cleanupStreamingDirectory(userPreferences.getDirectoryPreference().getDirectoryStreaming());
+        }
+    }
+
     /**
      * Cleanup any generated streaming recordings.
      * @param streamingDirectory
@@ -368,6 +412,63 @@ public class AudioStreamingManagerTest
         long now = System.currentTimeMillis();
         AudioCallSnapshot snapshot = new AudioCallSnapshot(
             new AudioCallId(3L, 1L, TimeslotMessage.TIMESLOT_0),
+            null,
+            aliasList,
+            identifierCollection,
+            broadcastChannels,
+            now,
+            now,
+            1,
+            1,
+            now,
+            now,
+            false,
+            true,
+            false,
+            false,
+            100,
+            false);
+        return new CompletedAudioCall(snapshot, audioBuffers);
+    }
+
+    /**
+     * A non-patch completed call: final TO = talkgroup 200 (routes to Stream B) plus a FROM radio 9999 that an
+     * operator has aliased to its own broadcast channel ("Radio Stream"). Both the TO stream and the FROM/radio
+     * stream are legitimate and present in the frozen set; the current-identifier filter must keep both.
+     */
+    private static CompletedAudioCall getFromRoutedNonPatchCall()
+    {
+        AliasList aliasList = p25AliasList("from-routed-test");
+
+        Alias talkgroupAlias = new Alias("talkgroup 200");
+        talkgroupAlias.setMatchIdentifier(new Talkgroup(Protocol.APCO25, TALKGROUP_2));
+        talkgroupAlias.addBroadcastChannel(new BroadcastChannel("Stream B"));
+        aliasList.addAlias(talkgroupAlias);
+
+        Alias radioAlias = new Alias("radio 9999");
+        radioAlias.setMatchIdentifier(new Radio(Protocol.APCO25, RADIO_1));
+        radioAlias.addBroadcastChannel(new BroadcastChannel("Radio Stream"));
+        aliasList.addAlias(radioAlias);
+
+        List<float[]> audioBuffers = new ArrayList<>();
+        ScalarRealOscillator oscillator = new ScalarRealOscillator(1000, 8000);
+        for(int x = 0; x < 100; x++)
+        {
+            audioBuffers.add(oscillator.generate(500));
+        }
+
+        MutableIdentifierCollection identifierCollection = new MutableIdentifierCollection();
+        identifierCollection.setTimeslot(TimeslotMessage.TIMESLOT_0);
+        identifierCollection.update(APCO25Talkgroup.create(TALKGROUP_2));
+        identifierCollection.update(getRadio());
+
+        Set<BroadcastChannel> broadcastChannels = new HashSet<>();
+        broadcastChannels.add(new BroadcastChannel("Stream B"));
+        broadcastChannels.add(new BroadcastChannel("Radio Stream"));
+
+        long now = System.currentTimeMillis();
+        AudioCallSnapshot snapshot = new AudioCallSnapshot(
+            new AudioCallId(4L, 1L, TimeslotMessage.TIMESLOT_0),
             null,
             aliasList,
             identifierCollection,

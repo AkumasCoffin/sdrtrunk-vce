@@ -278,56 +278,66 @@ public class AudioStreamingManager
 
         /**
          * Restricts a completed non-patch call's frozen broadcast channel set to only the channels that an alias of
-         * the call's final TO identifier routes to.
+         * an identifier STILL resident in the call routes to - the final TO, the source radio (FROM), or any other
+         * current identifier.
          *
          * A call accumulates a broadcast channel for every identifier the module ever saw while the call was open
          * (see MutableAudioCallBuilder). When a terminator is missed, or a new call is seeded from a stale identifier
          * collection, a previous talkgroup's TO can leave its broadcast channel in the frozen set. Streaming to that
          * raw set then uploads the call to a stream that belongs to the PREVIOUS talkgroup, tagged with the CURRENT
-         * TO. Recomputing the channel set from the final TO keeps the call only on the stream(s) its own talkgroup
-         * actually routes to. Patch groups are handled separately (see {@link #processPatchGroupTalkgroups}) and never
-         * reach this method.
+         * TO. Recomputing the channel set from the identifiers the call currently carries keeps it only on the
+         * stream(s) those identifiers actually route to - mirroring MutableAudioCallBuilder.rebuildBroadcastChannels,
+         * so this guard keeps exactly the set the builder would produce and prunes only channels routed by none of
+         * the current identifiers.
          *
-         * Never drops the call to zero channels when the final TO does route somewhere: if the TO's routed channels
-         * are (unexpectedly) absent from the frozen set, the TO alias channels are used directly.
+         * Both TO- and FROM-routed streams are preserved: an operator may attach a broadcast channel to a radio
+         * (source) alias - "stream everything unit N transmits" - and that stream is legitimate even on a call whose
+         * TO talkgroup routes elsewhere. Filtering by the TO alone would silently drop it. Patch groups are handled
+         * separately (see {@link #processPatchGroupTalkgroups}) and never reach this method.
+         *
+         * Never drops the call to zero channels when a current identifier does route somewhere: if none of those
+         * routes are present in the frozen set (unexpected), the current identifiers' alias channels are used
+         * directly, so the call reaches its live streams rather than nowhere.
          */
-        private Set<BroadcastChannel> broadcastChannelsForTo(CompletedAudioCall completedAudioCall,
-                                                             IdentifierCollection identifiers)
+        private Set<BroadcastChannel> broadcastChannelsForCurrentIdentifiers(CompletedAudioCall completedAudioCall,
+                                                                             IdentifierCollection identifiers)
         {
             Map<String, BroadcastChannel> frozenChannels =
                 indexFrozenBroadcastChannels(completedAudioCall.snapshot().broadcastChannels());
-            Identifier toIdentifier = identifiers.getToIdentifier();
             AliasList aliasList = completedAudioCall.snapshot().aliasList();
 
-            //Nothing to filter against, or no TO/alias list to filter by: preserve prior behaviour.
-            if(frozenChannels.isEmpty() || toIdentifier == null || aliasList == null)
+            //Nothing to filter against, or no alias list to filter by: preserve prior behaviour.
+            if(frozenChannels.isEmpty() || aliasList == null)
             {
                 return Set.copyOf(frozenChannels.values());
             }
 
-            //Routing keys that an alias of the final TO identifier routes to.
-            Set<String> toRoutingKeys = new TreeSet<>();
+            //Routing keys that an alias of ANY identifier still resident in the call routes to (TO, FROM, ...).
+            Set<String> currentRoutingKeys = new TreeSet<>();
 
-            for(Alias alias : aliasList.getAliases(toIdentifier))
+            for(Identifier identifier : identifiers.getIdentifiers())
             {
-                for(BroadcastChannel broadcastChannel : alias.getBroadcastChannels())
+                for(Alias alias : aliasList.getAliases(identifier))
                 {
-                    String routingKey = normalizeRoutingKey(broadcastChannel);
-
-                    if(routingKey != null)
+                    for(BroadcastChannel broadcastChannel : alias.getBroadcastChannels())
                     {
-                        toRoutingKeys.add(routingKey);
+                        String routingKey = normalizeRoutingKey(broadcastChannel);
+
+                        if(routingKey != null)
+                        {
+                            currentRoutingKeys.add(routingKey);
+                        }
                     }
                 }
             }
 
-            //Keep only the frozen channels the final TO routes to; collect the rest as stale drops.
+            //Keep only the frozen channels a current identifier routes to; collect the rest as stale drops.
             Set<BroadcastChannel> keptChannels = new LinkedHashSet<>();
             Set<String> droppedKeys = new TreeSet<>();
 
             for(Map.Entry<String, BroadcastChannel> entry : frozenChannels.entrySet())
             {
-                if(toRoutingKeys.contains(entry.getKey()))
+                if(currentRoutingKeys.contains(entry.getKey()))
                 {
                     keptChannels.add(entry.getValue());
                 }
@@ -337,19 +347,24 @@ public class AudioStreamingManager
                 }
             }
 
-            //Never drop the call entirely when the final TO does route somewhere.
-            if(keptChannels.isEmpty() && !toRoutingKeys.isEmpty())
+            //Never drop the call entirely when a current identifier does route somewhere but none of those routes
+            //survive in the frozen set: route the call to where its current identifiers actually point.
+            if(keptChannels.isEmpty() && !currentRoutingKeys.isEmpty())
             {
-                for(Alias alias : aliasList.getAliases(toIdentifier))
+                for(Identifier identifier : identifiers.getIdentifiers())
                 {
-                    keptChannels.addAll(alias.getBroadcastChannels());
+                    for(Alias alias : aliasList.getAliases(identifier))
+                    {
+                        keptChannels.addAll(alias.getBroadcastChannels());
+                    }
                 }
             }
 
             if(!droppedKeys.isEmpty() && mLog.isDebugEnabled())
             {
                 mLog.debug("Dropped stale broadcast channel(s) " + droppedKeys + " from call with final TO [" +
-                    toIdentifier + "] - those channels are routed only by a previous talkgroup's alias");
+                    identifiers.getToIdentifier() +
+                    "] - those channels are routed only by an identifier no longer resident in the call");
             }
 
             return Set.copyOf(keptChannels);
@@ -456,7 +471,7 @@ public class AudioStreamingManager
                         else
                         {
                             sentToStreamer |= processAudioCall(completedAudioCall, identifiers,
-                                broadcastChannelsForTo(completedAudioCall, identifiers));
+                                broadcastChannelsForCurrentIdentifiers(completedAudioCall, identifiers));
                         }
                     }
                 }
